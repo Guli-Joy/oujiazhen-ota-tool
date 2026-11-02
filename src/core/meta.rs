@@ -1,4 +1,4 @@
-//! 售后降级包的「真实身份」：从 ZIP 首部读 META-INF/com/android/metadata。
+//! 售后全量包的「真实身份」：从 ZIP 首部读 META-INF/com/android/metadata。
 //!
 //! 为什么需要：降级服务器只下发 colorosVersion（"ColorOS16.1.0" 这种大版本号），
 //! 同一机型的所有售后包在这个字段上长得一模一样，界面照着显示等于什么都没说

@@ -255,7 +255,7 @@ fn to_package(v: &Value) -> Package {
     let version = [coloros, android.clone()]
         .into_iter()
         .find(|s| !s.is_empty())
-        .unwrap_or_else(|| "售后降级包".to_string());
+        .unwrap_or_else(|| "售后全量包".to_string());
 
     Package {
         version,
