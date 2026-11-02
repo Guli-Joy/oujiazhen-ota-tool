@@ -16,25 +16,26 @@
 //!    返回值只说明外壳命令发出去了，根本不代表窗口出现 —— 这才是之前
 //!    「点了打开文件夹没反应」的真正原因：它一直在弹错误框，只是没人往那儿看。
 //!
-//! 现在用的是 SHOpenFolderAndSelectItems：外壳自己推荐的「打开文件夹并选中某项」
-//! 接口。它不创建任何进程，只是通过 COM 通知已经在跑的资源管理器去定位，
-//! 所以既不会崩，也不会被前台策略压到程序后面。文件不在了就退回打开所在目录。
+//! 主路径使用 Win10/Win11 都支持的 SHOpenFolderAndSelectItems；普通权限进程在
+//! 定位操作前按需请求一次 runas helper，再由 helper 使用 ShellExecuteExW 打开目录。
+//! 所有路径都作为参数数据传递，不拼接 explorer.exe 命令行。
 
-use std::ffi::{c_void, OsStr};
+use std::ffi::{c_void, OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[link(name = "shell32")]
 extern "system" {
-    fn ShellExecuteW(
-        hwnd: *mut c_void,
-        op: *const u16,
-        file: *const u16,
-        params: *const u16,
-        dir: *const u16,
-        show: i32,
-    ) -> isize;
-    fn ILCreateFromPathW(psz_path: *const u16) -> *mut c_void;
+    fn SHParseDisplayName(
+        psz_name: *const u16,
+        pbc: *mut c_void,
+        ppidl: *mut *mut c_void,
+        sfgao_in: u32,
+        psfgao_out: *mut u32,
+    ) -> i32;
+    fn ILClone(pidl: *const c_void) -> *mut c_void;
+    fn ILFindLastID(pidl: *const c_void) -> *mut c_void;
+    fn ILRemoveLastID(pidl: *mut c_void) -> i32;
     fn ILFree(pidl: *mut c_void);
     fn SHOpenFolderAndSelectItems(
         pidl_folder: *const c_void,
@@ -59,27 +60,295 @@ const ASFW_ANY: u32 = -1i32 as u32;
 /// COINIT_APARTMENTTHREADED：外壳对象要求单线程套间
 const COINIT_APARTMENTTHREADED: u32 = 0x2;
 
-fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+fn wide_os(s: &OsStr) -> Vec<u16> {
+    s.encode_wide().chain(std::iter::once(0)).collect()
 }
 
-/// 让 pidl 指向的项在资源管理器里被选中（pidl 是文件夹时就打开它自己）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RevealTarget {
+    Folder(PathBuf),
+    Item { folder: PathBuf, name: OsString },
+}
+
+/// 将用户要定位的路径拆成 Shell API 所需的「父文件夹 + 子项」。
 ///
-/// 返回 HRESULT：0 表示外壳确实接下了这个请求。非 0 时调用方会退回打开目录，
-/// 并把码放进提示里方便排查（远程会话、被安全软件拦住的账户都可能返回别的值）。
-fn select_pidl(pidl: *mut c_void) -> i32 {
-    if pidl.is_null() {
-        // ILCreateFromPathW 失败（路径不存在 / 不是绝对路径）
-        return -0x7FFF_FFFF;
+/// 显式拆出父文件夹和子项 PIDL，避免不同 Shell 实现对完整文件 PIDL 的兼容性
+/// 差异；失败时只回退到打开父目录，不再调用 `explorer.exe /select`。
+fn reveal_target(path: &Path, select: bool) -> RevealTarget {
+    if select {
+        if let (Some(folder), Some(name)) = (path.parent(), path.file_name()) {
+            return RevealTarget::Item {
+                folder: folder.to_path_buf(),
+                name: name.to_os_string(),
+            };
+        }
     }
+    RevealTarget::Folder(path.to_path_buf())
+}
+
+fn parse_pidl(path: &Path) -> Result<*mut c_void, i64> {
+    let w = wide_os(path.as_os_str());
+    let mut pidl = std::ptr::null_mut();
+    let hr = unsafe {
+        SHParseDisplayName(
+            w.as_ptr(),
+            std::ptr::null_mut(),
+            &mut pidl,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if hr < 0 || pidl.is_null() {
+        Err(hr as i64)
+    } else {
+        Ok(pidl)
+    }
+}
+
+/// 打开一个文件夹 PIDL。
+fn open_folder(path: &Path) -> Result<(), i64> {
+    let pidl = parse_pidl(path)?;
     let hr = unsafe { SHOpenFolderAndSelectItems(pidl, 0, std::ptr::null(), 0) };
     unsafe { ILFree(pidl) };
-    hr
+    if hr == 0 {
+        Ok(())
+    } else {
+        Err(hr as i64)
+    }
 }
 
-fn pidl_of(path: &str) -> *mut c_void {
-    let w = wide(path);
-    unsafe { ILCreateFromPathW(w.as_ptr()) }
+/// 在父文件夹中选中一个子项 PIDL。
+fn select_item(folder: &Path, name: &OsStr) -> Result<(), i64> {
+    let full = folder.join(name);
+    let full_pidl = parse_pidl(&full)?;
+    let folder_pidl = unsafe { ILClone(full_pidl) };
+    let child_pidl = unsafe { ILFindLastID(full_pidl) };
+    if folder_pidl.is_null() || child_pidl.is_null() {
+        unsafe {
+            if !folder_pidl.is_null() {
+                ILFree(folder_pidl);
+            }
+            ILFree(full_pidl);
+        }
+        return Err(-0x7FFF_FFFE);
+    }
+
+    let removed = unsafe { ILRemoveLastID(folder_pidl) };
+    if removed == 0 {
+        unsafe {
+            ILFree(folder_pidl);
+            ILFree(full_pidl);
+        }
+        return Err(-0x7FFF_FFFD);
+    }
+
+    let child_list = [child_pidl as *const c_void];
+    let hr = unsafe { SHOpenFolderAndSelectItems(folder_pidl, 1, child_list.as_ptr(), 0) };
+    unsafe {
+        ILFree(folder_pidl);
+        ILFree(full_pidl);
+    }
+    if hr == 0 {
+        Ok(())
+    } else {
+        Err(hr as i64)
+    }
+}
+
+#[repr(C)]
+struct ShellExecuteInfoW {
+    cb_size: u32,
+    f_mask: u32,
+    hwnd: isize,
+    lp_verb: *const u16,
+    lp_file: *const u16,
+    lp_parameters: *const u16,
+    lp_directory: *const u16,
+    n_show: i32,
+    h_inst_app: isize,
+    lp_id_list: *mut c_void,
+    lp_class: *const u16,
+    hkey_class: isize,
+    dw_hot_key: u32,
+    h_icon_or_monitor: isize,
+    h_process: isize,
+}
+
+const SW_SHOWNORMAL: i32 = 1;
+const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
+
+#[link(name = "shell32")]
+extern "system" {
+    fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn CloseHandle(handle: isize) -> i32;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+    fn GetTokenInformation(
+        token: isize,
+        class: u32,
+        data: *mut c_void,
+        data_len: u32,
+        return_len: *mut u32,
+    ) -> i32;
+}
+
+#[repr(C)]
+struct TokenElevation {
+    token_is_elevated: u32,
+}
+
+const TOKEN_QUERY: u32 = 0x0008;
+const TOKEN_ELEVATION_CLASS: u32 = 20;
+
+/// 使用 Windows Shell 的标准执行入口打开目录。
+///
+/// 这里传目录路径本身，不传 `explorer.exe`，因此由 Win10/Win11 当前 Shell
+/// 负责复用或创建资源管理器窗口，不会让应用自行拉起 Explorer 子进程。
+fn shell_execute_open(path: &Path) -> Result<(), i64> {
+    let verb = wide_os(OsStr::new("open"));
+    let file = wide_os(path.as_os_str());
+    let mut info = ShellExecuteInfoW {
+        cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+        f_mask: SEE_MASK_NOASYNC,
+        hwnd: 0,
+        lp_verb: verb.as_ptr(),
+        lp_file: file.as_ptr(),
+        lp_parameters: std::ptr::null(),
+        lp_directory: std::ptr::null(),
+        n_show: SW_SHOWNORMAL,
+        h_inst_app: 0,
+        lp_id_list: std::ptr::null_mut(),
+        lp_class: std::ptr::null(),
+        hkey_class: 0,
+        dw_hot_key: 0,
+        h_icon_or_monitor: 0,
+        h_process: 0,
+    };
+    if unsafe { ShellExecuteExW(&mut info) } != 0 {
+        Ok(())
+    } else {
+        let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        Err(code as i64)
+    }
+}
+
+fn quote_windows_arg(value: &OsStr) -> String {
+    let mut out = String::from("\"");
+    let mut slashes = 0usize;
+    for ch in value.to_string_lossy().chars() {
+        if ch == '\\' {
+            slashes += 1;
+            continue;
+        }
+        if ch == '"' {
+            out.push_str(&"\\".repeat(slashes * 2 + 1));
+            out.push('"');
+        } else {
+            out.push_str(&"\\".repeat(slashes));
+            out.push(ch);
+        }
+        slashes = 0;
+    }
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
+}
+
+fn is_access_denied(code: i64) -> bool {
+    code == 5 || code == -2_147_024_891
+}
+
+fn should_request_elevation(code: i64) -> bool {
+    is_access_denied(code) || code == -2
+}
+
+fn is_process_elevated() -> bool {
+    let mut token = 0isize;
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    let mut elevation = TokenElevation {
+        token_is_elevated: 0,
+    };
+    let mut returned = 0u32;
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_ELEVATION_CLASS,
+            (&mut elevation as *mut TokenElevation).cast(),
+            std::mem::size_of::<TokenElevation>() as u32,
+            &mut returned,
+        )
+    } != 0;
+    unsafe { CloseHandle(token) };
+    ok && elevation.token_is_elevated != 0
+}
+
+fn preserve_access_denied<F>(first: Result<(), i64>, fallback: F) -> Result<(), i64>
+where
+    F: FnOnce() -> Result<(), i64>,
+{
+    match first {
+        Ok(()) => Ok(()),
+        Err(code) if should_request_elevation(code) => Err(code),
+        Err(_) => fallback(),
+    }
+}
+
+fn relaunch_elevated_helper(path: &str, select: bool) -> Result<(), i64> {
+    let exe = std::env::current_exe().map_err(|e| e.raw_os_error().unwrap_or(-1) as i64)?;
+    let verb = wide_os(OsStr::new("runas"));
+    let file = wide_os(exe.as_os_str());
+    let params = format!(
+        "--reveal-helper {} {}",
+        quote_windows_arg(OsStr::new(path)),
+        if select { "1" } else { "0" }
+    );
+    let parameters = wide_os(OsStr::new(&params));
+    let mut info = ShellExecuteInfoW {
+        cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+        f_mask: SEE_MASK_NOASYNC,
+        hwnd: 0,
+        lp_verb: verb.as_ptr(),
+        lp_file: file.as_ptr(),
+        lp_parameters: parameters.as_ptr(),
+        lp_directory: std::ptr::null(),
+        n_show: SW_SHOWNORMAL,
+        h_inst_app: 0,
+        lp_id_list: std::ptr::null_mut(),
+        lp_class: std::ptr::null(),
+        hkey_class: 0,
+        dw_hot_key: 0,
+        h_icon_or_monitor: 0,
+        h_process: 0,
+    };
+    if unsafe { ShellExecuteExW(&mut info) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1) as i64)
+    }
+}
+
+fn fallback_open_folder(path: &Path) -> Result<(), i64> {
+    shell_execute_open(path)
+}
+
+fn open_folder_with_fallback(folder: &Path, first: Result<(), i64>) -> Result<(), i64> {
+    preserve_access_denied(first, || fallback_open_folder(folder))
+}
+
+fn reveal_item_with_fallback(folder: &Path, name: &OsStr) -> Result<(), i64> {
+    preserve_access_denied(select_item(folder, name), || {
+        open_folder_with_fallback(folder, open_folder(folder))
+    })
 }
 
 /// 打开资源管理器并定位 path：文件就选中它，目录就打开它。
@@ -88,10 +357,23 @@ fn pidl_of(path: &str) -> *mut c_void {
 /// 把错误码带出去是刻意的：这类调用失败时系统只给一个数字，没有它根本没法排查。
 ///
 /// 为什么必须另起线程：SHOpenFolderAndSelectItems 是 COM 调用，要求调用线程是
-/// 单线程套间（STA）。而 egui 的主线程由 winit 建出来，套间模型不受我们控制
-/// （实测主线程上调它一律失败，退回 ShellExecuteW 又拿到 5 = 拒绝访问）。
-/// 起一个专门的新线程，先 CoInitializeEx(APARTMENTTHREADED) 再调用，就一定在 STA 里。
+/// 单线程套间（STA）。而 egui 的主线程由 winit 建出来，套间模型不受我们控制，
+/// 所以起一个专门的新线程，先 CoInitializeEx(APARTMENTTHREADED) 再调用，就一定在 STA 里。
 pub fn reveal(path: &str, select: bool) -> Result<(), i64> {
+    if !is_process_elevated() {
+        return relaunch_elevated_helper(path, select);
+    }
+    match reveal_once(path, select) {
+        Err(code) if should_request_elevation(code) => relaunch_elevated_helper(path, select),
+        result => result,
+    }
+}
+
+pub fn reveal_helper(path: &str, select: bool) -> Result<(), i64> {
+    reveal_once(path, select)
+}
+
+fn reveal_once(path: &str, select: bool) -> Result<(), i64> {
     let path = path.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     // 线程起不来（极端资源耗尽）就当外壳调用失败，由调用方退回剪贴板
@@ -125,88 +407,31 @@ fn reveal_sta(path: &str, select: bool) -> Result<(), i64> {
         env("TEMP"),
     ));
 
-    let mut last: i64 = 0;
-    if select {
-        let pidl = pidl_of(path);
-        let hr = select_pidl(pidl);
-        log.push_str(&format!("select file: pidl_null={} hr=0x{:08X}\n", pidl.is_null(), hr));
-        if hr == 0 {
-            flush_log(&log);
-            return Ok(());
+    let path_obj = Path::new(path);
+    let target = reveal_target(path_obj, select);
+    let result = match &target {
+        RevealTarget::Item { folder, name } => {
+            let result = reveal_item_with_fallback(folder, name);
+            log.push_str(&format!(
+                "select item [{}\\{}]: {:?}\n",
+                folder.display(),
+                name.to_string_lossy(),
+                result
+            ));
+            result
         }
-        last = hr as i64;
-    }
-
-    // 走到这里说明「选中某个文件」没成功（多半是文件已经不在了），
-    // 退一步直接打开所在目录。目录项同样走这个接口，不 spawn 进程。
-    if let Some(dir) = Path::new(path).parent().map(|p| p.display().to_string()) {
-        let pidl = pidl_of(&dir);
-        let hr = select_pidl(pidl);
-        log.push_str(&format!("select dir [{dir}]: pidl_null={} hr=0x{:08X}\n", pidl.is_null(), hr));
-        if hr == 0 {
-            flush_log(&log);
-            return Ok(());
+        RevealTarget::Folder(folder) => {
+            let result = open_folder_with_fallback(folder, open_folder(folder));
+            log.push_str(&format!("open folder [{}]: {:?}\n", folder.display(), result));
+            result
         }
-        last = hr as i64;
-    }
-
-    // 最后一条路：让外壳按默认动词打开。注意传的是**路径**而不是 explorer.exe ——
-    // 后者正是第 3 条踩过的 0x0142 崩溃。先试所在目录（用户要的就是"看看文件在哪"），
-    // 目录也打不开才试文件本身。
-    let dir_try = Path::new(path).parent().map(|p| p.display().to_string());
-    let mut rets: Vec<(&str, isize)> = Vec::new();
-    for (label, target) in [
-        ("dir", dir_try.clone()),
-        ("file", Some(path.to_string())),
-    ] {
-        let Some(t) = target else { continue };
-        let op = wide("open");
-        let w = wide(&t);
-        let ret = unsafe {
-            ShellExecuteW(
-                std::ptr::null_mut(),
-                op.as_ptr(),
-                w.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1, // SW_SHOWNORMAL
-            )
-        };
-        rets.push((label, ret));
-        if ret > 32 {
-            log.push_str(&format!("ShellExecuteW({label}) ret={ret} OK\n"));
-            flush_log(&log);
-            return Ok(());
-        }
-    }
-    // 再退一步：经典的 explorer.exe /select 写法。它在本机能起来的桌面会话里
-    // 通常有效（前面踩到的 0x0142 只在"进程环境块被污染"的场合出现），
-    // 所以留作最后一条路，而不是当主路径。
-    let op = wide("open");
-    let exe = wide("explorer.exe");
-    let args = wide(&format!("/select,\"{}\"", path));
-    let ret = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            op.as_ptr(),
-            exe.as_ptr(),
-            args.as_ptr(),
-            std::ptr::null(),
-            1,
-        )
     };
-    rets.push(("explorer-select", ret));
-    log.push_str(&format!("ShellExecuteW results: {rets:?}\n"));
-    flush_log(&log);
-    if ret > 32 {
-        Ok(())
-    } else {
-        Err(if last != 0 {
-            last
-        } else {
-            rets.first().map(|r| r.1 as i64).unwrap_or(-3)
-        })
+
+    if hr_init < 0 {
+        log.push_str(&format!("CoInitializeEx failed: 0x{hr_init:08X}\n"));
     }
+    flush_log(&log);
+    result
 }
 
 /// 把排查信息追加到 %TEMP%\ota-tool-shell.log（只在开发期看得见，正式版没有副作）
@@ -217,5 +442,75 @@ fn flush_log(s: &str) {
             use std::io::Write;
             let _ = f.write_all(s.as_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_access_denied, should_request_elevation, quote_windows_arg, reveal_target, RevealTarget, preserve_access_denied};
+    use std::path::Path;
+
+    #[test]
+    fn denial_is_not_replaced_by_a_later_failure_or_false_fallback_success() {
+        let mut called = false;
+        let result = preserve_access_denied(Err(-2_147_024_891), || {
+            called = true;
+            Ok(())
+        });
+        assert_eq!(result, Err(-2_147_024_891));
+        assert!(!called);
+    }
+
+    #[test]
+    fn unrelated_failure_can_use_a_fallback() {
+        assert_eq!(preserve_access_denied(Err(2), || Ok(())), Ok(()));
+        assert_eq!(preserve_access_denied(Ok(()), || Err(5)), Ok(()));
+    }
+
+    #[test]
+    fn access_denied_codes_trigger_elevation_policy() {
+        assert!(is_access_denied(5));
+        assert!(is_access_denied(-2_147_024_891));
+        assert!(!is_access_denied(2));
+    }
+
+    #[test]
+    fn a_shell_timeout_also_requests_elevation() {
+        assert!(should_request_elevation(-2));
+        assert!(should_request_elevation(5));
+        assert!(!should_request_elevation(2));
+    }
+
+    #[test]
+    fn elevated_helper_quotes_windows_paths() {
+        assert_eq!(
+            quote_windows_arg(std::ffi::OsStr::new(r"C:\Program Files\OTA\file.zip")),
+            r#""C:\Program Files\OTA\file.zip""#
+        );
+        assert_eq!(
+            quote_windows_arg(std::ffi::OsStr::new(r"C:\Program Files\OTA\")),
+            r#""C:\Program Files\OTA\\""#
+        );
+    }
+
+    #[test]
+    fn file_selection_uses_parent_folder_and_child_name() {
+        let target = reveal_target(Path::new(r"C:\Users\GuLi\Downloads\package.zip"), true);
+        assert_eq!(
+            target,
+            RevealTarget::Item {
+                folder: Path::new(r"C:\Users\GuLi\Downloads").to_path_buf(),
+                name: "package.zip".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn directory_open_uses_the_directory_pidls_directly() {
+        let target = reveal_target(Path::new(r"C:\Users\GuLi\Downloads"), false);
+        assert_eq!(
+            target,
+            RevealTarget::Folder(Path::new(r"C:\Users\GuLi\Downloads").to_path_buf())
+        );
     }
 }

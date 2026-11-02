@@ -47,8 +47,8 @@ pub struct LinkInfo {
     pub source: Source,
 }
 
-/// 一次合并查询的返回值：(机型代号, 版本清单, 售后包, 社区源是否可用)
-type QueryResult = Result<(String, Vec<Package>, Vec<Package>, bool), String>;
+/// 一次合并查询的返回值：(机型代号, 版本清单, 售后包, 社区源是否可用, 售后通道结局)
+type QueryResult = Result<(String, Vec<Package>, Vec<Package>, bool, ota::AfterState), String>;
 
 /// 当前选中的机型
 #[derive(Clone)]
@@ -66,6 +66,8 @@ pub struct App {
     pub packages: Vec<Package>,
     /// 售后（降级 / 维修）包。单独一栏，不和版本清单混排 —— 版本号不可比。
     pub aftersale: Vec<Package>,
+    /// 售后通道本次的结局。列表为空时界面靠它区分「本来没有」和「这次没查通」。
+    pub after_state: ota::AfterState,
     query_rx: Option<Receiver<QueryResult>>,
     /// 社区源本次是否用上了（用不上时界面不展示相关文案）
     pub community_ok: bool,
@@ -108,6 +110,7 @@ impl App {
             current: None,
             packages: Vec::new(),
             aftersale: Vec::new(),
+            after_state: ota::AfterState::Unknown,
             query_rx: None,
             community_ok: false,
             probe_rx: None,
@@ -223,7 +226,13 @@ impl App {
                     name, code
                 ))
             } else {
-                Ok((code, m.packages, m.aftersale, m.community_ok))
+                Ok((
+                    code,
+                    m.packages,
+                    m.aftersale,
+                    m.community_ok,
+                    m.after_state,
+                ))
             };
             let _ = tx.send(res);
         });
@@ -275,13 +284,14 @@ impl App {
 
         if let Some(rx) = &self.query_rx {
             match rx.try_recv() {
-                Ok(Ok((code, pkgs, after, community))) => {
+                Ok(Ok((code, pkgs, after, community, after_state))) => {
                     let n = pkgs.len();
                     // 官方 = 版本清单里去掉社区源补的那些；售后包单独计数，
                     // 不能混进这个口径，否则「官方 N 个」会把降级包也数进去。
                     let official = pkgs.iter().filter(|p| p.source == Source::Official).count();
                     self.packages = pkgs;
                     self.aftersale = after;
+                    self.after_state = after_state;
                     self.community_ok = community;
                     if let Some(m) = &mut self.current {
                         if m.name == code {
@@ -290,7 +300,22 @@ impl App {
                     }
                     self.querying = false;
                     self.query_rx = None;
+                    // 售后那段结论单独拼：空着不等于「没有」，必须把「没查通」说清楚，
+                    // 否则用户只会看到售后分区不见了，以为程序坏了。
                     let extra = self.aftersale.len();
+                    let tail = if extra > 0 {
+                        format!("；另有 {} 个售后全量包", extra)
+                    } else {
+                        match after_state {
+                            ota::AfterState::NoProject => {
+                                "；该机型的官方数据里没有售后全量包".to_string()
+                            }
+                            ota::AfterState::Unknown => {
+                                "；售后包这次没查到，可点「重新扫描」重试".to_string()
+                            }
+                            ota::AfterState::Ok => String::new(),
+                        }
+                    };
                     if community && n > official {
                         self.set(
                             Tone::Ok,
@@ -299,20 +324,17 @@ impl App {
                                 n,
                                 official,
                                 n - official,
-                                if extra > 0 {
-                                    format!("；另有 {} 个售后全量包", extra)
-                                } else {
-                                    String::new()
-                                }
+                                tail
                             ),
                         );
-                    } else if extra > 0 {
-                        self.set(
-                            Tone::Ok,
-                            format!("找到 {} 个可下载的全量包，另有 {} 个售后全量包", n, extra),
-                        );
                     } else {
-                        self.set(Tone::Ok, format!("找到 {} 个可下载的全量包", n));
+                        // 售后一个都没有时语气收一档：这句补充说明比「找到了 N 个」更值得看
+                        let tone = if extra == 0 && after_state == ota::AfterState::Unknown {
+                            Tone::Warn
+                        } else {
+                            Tone::Ok
+                        };
+                        self.set(tone, format!("找到 {} 个可下载的全量包{}", n, tail));
                     }
                     self.probe_community();
                 }
@@ -739,8 +761,9 @@ impl App {
     ///    （.zip 变成打开压缩包查看器），而且是同步等待，界面会卡。
     /// 2. std::process::Command 直接起 explorer.exe：**看起来成功，其实什么都不会弹**。
     ///    explorer.exe 被直接 spawn 时初始化失败，退出码 0xC0000142
-    ///    （STATUS_DLL_INIT_FAILED），但 spawn() 本身返回 Ok，
-    ///    所以只能走外壳的 ShellExecuteW，那才是资源管理器期望的启动方式。
+    ///    （STATUS_DLL_INIT_FAILED），但 spawn() 本身返回 Ok。
+    ///    现在统一走 `SHOpenFolderAndSelectItems` 与 Win10/Win11 Shell 回退；
+    ///    若明确返回拒绝访问，只在本次定位操作请求一次 UAC helper。
     /// 定位任意已下载文件（历史记录里用）。
     ///
     /// 与 reveal_download 同一套策略：文件在就选中它，不在就打开所在目录，

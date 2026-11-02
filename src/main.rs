@@ -73,6 +73,20 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut helper_args = std::env::args().skip(1);
+        if helper_args.next().as_deref() == Some("--reveal-helper") {
+            let path = helper_args.next().unwrap_or_default();
+            let select = helper_args.next().as_deref() == Some("1");
+            let code = match app::shell::reveal_helper(&path, select) {
+                Ok(()) => 0,
+                Err(_) => 1,
+            };
+            std::process::exit(code);
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 820.0])

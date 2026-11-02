@@ -19,6 +19,7 @@ dist/
 # ---- 编辑器 / 系统 ----
 .vscode/
 .idea/
+.serena/
 *.swp
 *~
 Thumbs.db

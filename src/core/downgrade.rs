@@ -15,7 +15,7 @@ use sha1::Sha1;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::core::meta;
-use crate::core::ota::{Package, Source};
+use crate::core::ota::{self, Package, Source};
 
 const ENDPOINT: &str = "https://downgrade.coloros.com/downgrade/query-v3";
 
@@ -38,16 +38,42 @@ const DUIDS: [&str; 1] = [
 const MAX_TRIES: usize = 8;
 const RETRY_WAIT_MS: u64 = 600;
 
-/// 查询某机型的售后（降级 / 维修）全量包。失败一律返回空 Vec，绝不 panic。
-pub fn query(code: &str) -> Vec<Package> {
+/// 售后包查询结果：包本身，外加「为什么是空的」。
+///
+/// 只回一个空 Vec 的话，界面分不清「这台机器官方就没有售后包」和「这次没查通」，
+/// 用户看到的就是售后分区无声无息地不见了 —— 那正是「怎么只有某个机型有」的困惑来源。
+pub struct AfterSale {
+    pub list: Vec<Package>,
+    pub soft: ota::Soft,
+}
+
+impl AfterSale {
+    fn none(soft: ota::Soft) -> Self {
+        Self { list: Vec::new(), soft }
+    }
+
+    /// 售后那条线程自己 panic 了（网络库或解析里不该发生的意外）时的兜底。
+    /// 结论只能算「未知」：不能因为线程崩了就告诉用户「这台机器没有售后包」。
+    pub fn unknown() -> Self {
+        Self::none(ota::Soft::Unknown)
+    }
+}
+
+/// 查询某机型的售后（降级 / 维修）全量包。失败一律返回空清单，绝不 panic。
+///
+/// 项目号（P）由调用方给。降级服务器只认官方 OTA 里的 `oplus_separate_soft`，
+/// 它是两条协议之间唯一的桥；拿不到就等于没有售后包，不必再打扰降级服务器。
+///
+/// 之所以由调用方传入而不是自己查：合并查询时分支扫描本来就要把这 26 次 OTA
+/// 请求打一遍，项目号顺手就有；售后通道再自己问一轮，等于把同一批请求打两遍，
+/// 而那正是最容易降级的接口。
+pub fn query_with(code: &str, soft: ota::Soft) -> AfterSale {
     let code = code.trim();
     if code.is_empty() {
-        return Vec::new();
+        return AfterSale::none(ota::Soft::Unknown);
     }
-    // 降级服务器只认官方 OTA 里的项目号（oplus_separate_soft），它是两条协议唯一的桥；
-    // 查不到就等于没有售后包，不必再打扰降级服务器。
-    let Some(prj) = crate::core::ota::separate_soft(code) else {
-        return Vec::new();
+    let ota::Soft::Found(prj) = soft.clone() else {
+        return AfterSale::none(soft);
     };
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(15))
@@ -61,10 +87,12 @@ pub fn query(code: &str) -> Vec<Package> {
         // 不区分「服务端抖动」与「真的没包」：两者在 HTTP 层长得一样（500 / 解密失败 /
         // 空 data），重发几次的代价远小于误报「未查到售后包」。
         if let Ok(list) = try_once(&agent, code, &prj) {
-            return enrich(list);
+            return AfterSale { list: enrich(list), soft };
         }
     }
-    Vec::new()
+    // 项目号是拿到了，降级服务器却 8 次都没给结果：售后分区仍然该显示，
+    // 只是标明「本次没查到」而不是「没有」，用户重试一次往往就有了。
+    AfterSale::none(soft)
 }
 
 /// 单次请求：换一套新会话密钥，拼 body，发出去，解析响应。每次重试都重生成 session_key /

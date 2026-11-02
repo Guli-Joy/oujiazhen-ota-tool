@@ -6,7 +6,9 @@ use rand::RngCore;
 use rsa::{pkcs8::DecodePublicKey, Oaep, RsaPublicKey};
 use serde_json::{json, Value};
 use sha1::Sha1;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
@@ -162,7 +164,14 @@ fn wrap_key(aes_key: &[u8]) -> Result<String, String> {
 
 /// 单次查询：ota_version 形如 RMX3888_11.F.01_0001_197001010000
 pub fn query(model: &str, ota_version: &str) -> Result<Package, String> {
-    let data = query_json(model, ota_version)?;
+    package_of(&query_json(model, ota_version)?)
+}
+
+/// 从已解密的响应里取出这个分支的包。
+///
+/// 和 query_json 分开，是因为分支扫描既要用响应里的包、又要顺手从同一个响应里
+/// 捞项目号：同一次网络往返能拿到两样东西，没必要为此多查一遍。
+fn package_of(data: &Value) -> Result<Package, String> {
     let comps = data
         .get("components")
         .and_then(|v| v.as_array())
@@ -314,59 +323,131 @@ pub fn query_json(model: &str, ota_version: &str) -> Result<Value, String> {
     Ok(data)
 }
 
+/// 项目号的查询结论
+///
+/// 「查不到」和「没查通」必须分开：前者是这台机器确实没有售后包（可以明确告诉
+/// 用户），后者只是这一次没问到（应该提示重试），混成一个 None 就再也解释不清
+/// 界面上为什么没有售后分区了。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Soft {
+    /// 拿到了项目号
+    Found(String),
+    /// 接口正常回话，但响应里没有 `oplus_separate_soft` 字段
+    Absent,
+    /// 三轮都没拿到正常响应（服务器降级 / 网络异常），结论未知
+    Unknown,
+}
+
+/// 项目号的内存缓存（只在本次运行内有效）。
+///
+/// 官方接口对同一机型的连续查询很容易降级，而项目号一旦查到就不会变，
+/// 缓存下来至少让「重新扫描」「切回上一个机型」这些操作不再赌运气。
+fn soft_cache() -> &'static Mutex<HashMap<String, Soft>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Soft>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_get(model: &str) -> Option<Soft> {
+    soft_cache().lock().ok()?.get(model).cloned()
+}
+
+/// 只缓存「拿到了项目号」这一种。
+///
+/// 「没有」和「没查通」都不写缓存：它们要么是官方数据本来就缺，要么是这一轮
+/// 服务器状态不好，反正值不值得信取决于下一次请求的结果 —— 记住坏结论只会在
+/// 用户重扫时把一个可能已经变好的答案继续挡住。
+fn cache_put(model: &str, soft: &Soft) {
+    if !matches!(soft, Soft::Found(_)) {
+        return;
+    }
+    if let Ok(mut m) = soft_cache().lock() {
+        m.insert(model.to_string(), soft.clone());
+    }
+}
+
 /// 取机型在官方 OTA 里的 `oplus_separate_soft`（5 位项目号）。
 ///
 /// 售后（降级）服务器只认这个项目号，不认机型代号，所以它是两条协议之间
 /// 唯一的桥。这个值放在 OTA 响应的 `vabInfo.data.header` 字符串数组里，
 /// 形如 `oplus_separate_soft=23607`，与分支无关（同一机型任何分支查出同一个值），
 /// 因此这里用通配版本号随便挑几个分支试，拿到一个就返回。
-pub fn separate_soft(model: &str) -> Option<String> {
-    // 官方接口对同一机型的高频查询会返回「无 components」的降级响应，
-    // 换分支重试比等它自动放开更快，也没有额外代价。
-    for letter in ["A", "F", "C", "B", "E", "D"] {
-        let ov = format!("{}_11.{}.01_0001_197001010000", model, letter);
-        let Ok(v) = query_json(model, &ov) else { continue };
-        let header = v
-            .get("components")
-            .and_then(|c| c.as_array())
-            .and_then(|c| c.first())
-            .and_then(|c| c.get("componentPackets"))
-            .and_then(|p| p.get("vabInfo"))
-            .and_then(|p| p.get("data"))
-            .and_then(|p| p.get("header"))
-            .and_then(|h| h.as_array());
-        let Some(header) = header else { continue };
-        for item in header {
-            let Some(s) = item.as_str() else { continue };
-            if let Some(v) = s.strip_prefix("oplus_separate_soft=") {
-                let v = v.trim();
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
+pub fn separate_soft(model: &str) -> Soft {
+    // 本次运行里查过一次就够了：项目号是机型的固有属性，不会变。
+    if let Some(hit) = cache_get(model) {
+        return hit;
     }
-    None
+    let soft = separate_soft_uncached(model);
+    cache_put(model, &soft);
+    soft
 }
 
-/// 探measure某机型所有真实存在的分支，返回每个分支的最新包
-pub fn query_all_branches(model: &str) -> Vec<Package> {
+fn separate_soft_uncached(model: &str) -> Soft {
+    // 不能只跑一轮。界面查询时这条线和 26 分支扫描、升级链、社区源是同时在跑的，
+    // 官方接口会把这种并发判成异常，回一个「没有 components」的降级响应；只跑一轮
+    // 很容易刚好撞上，六个分支全被打回就直接 None，整个售后分区凭空消失 —— 这正是
+    // 「只有某个机型有售后包」的成因。
+    //
+    // 要不要再来一轮，看这一轮有没有「拿到完整响应」：
+    // - query_json 报错（服务器忙 / 500 / 参数字段不符）：等于没查，必须再来；
+    // - 响应里没有 components 或没有 vabInfo.data.header：同样是降级响应、等于没查，
+    //   不能据此断定「这台机器没有售后包」。
+    // 只有真的读到 header 数组却没找到 oplus_separate_soft，才算查有结论、可以收工。
+    for round in 0..3 {
+        let mut conclusive = false;
+        for letter in ["A", "F", "C", "B", "E", "D"] {
+            let ov = format!("{}_11.{}.01_0001_197001010000", model, letter);
+            let Ok(v) = query_json(model, &ov) else { continue };
+            if let Some(soft) = soft_in(&v) {
+                return Soft::Found(soft);
+            }
+            if responded(&v) {
+                conclusive = true;
+            }
+        }
+        if conclusive {
+            return Soft::Absent;
+        }
+        std::thread::sleep(Duration::from_millis(250 * (round + 1) as u64));
+    }
+    Soft::Unknown
+}
+
+/// 探测某机型所有真实存在的分支，返回每个分支的最新包，并顺手从这 26 次响应里
+/// 把项目号捞出来。
+///
+/// 分支扫描本来就要把 A–Z 各问一遍，而这些响应里就带着 `oplus_separate_soft`；
+/// 售后通道原本还要为此单独再问一轮官方 OTA，等于把同一批请求打了两遍 —— 官方
+/// 接口本来就容易降级，多打一轮就多一分查不到项目号的机会。所以把两件事合成
+/// 一件：扫到项目号顺带返回，售后那条线直接用它，不再自己发起查询。
+pub fn query_all_branches_harvest(model: &str) -> (Vec<Package>, Soft) {
     let letters: Vec<char> = ('A'..='Z').collect();
     let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // 项目号与分支无关，谁先捞到算谁的；用 OnceLock 语义避免重复回填
+    let found: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+    // 有没有任何一个分支真的回了一个包（用于区分「没查到」与「没查通」）。
+    // 注意不能看 vabInfo：老机型的正常响应里也没有这个字段，那恰恰是「没有项目号」。
+    let conclusive = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let chunk = 6usize;
     for group in letters.chunks(chunk) {
         let mut handles = Vec::new();
         for &letter in group {
             let model_s = model.to_string();
             let slot = results.clone();
+            let found_slot = found.clone();
+            let conc_slot = conclusive.clone();
             handles.push(std::thread::spawn(move || {
                 let ov = format!("{}_11.{}.01_0001_197001010000", model_s, letter);
-                if let Ok(mut p) = query(&model_s, &ov) {
-                    if !p.manual_url.is_empty() {
-                        p.branch = letter.to_string();
-                        if let Ok(mut v) = slot.lock() {
-                            v.push(p);
-                        }
+                let Ok(data) = query_json(&model_s, &ov) else { return };
+                if let Some(v) = soft_in(&data) {
+                    let _ = found_slot.set(v);
+                } else if responded(&data) {
+                    conc_slot.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                let Ok(mut p) = package_of(&data) else { return };
+                if !p.manual_url.is_empty() {
+                    p.branch = letter.to_string();
+                    if let Ok(mut v) = slot.lock() {
+                        v.push(p);
                     }
                 }
             }));
@@ -375,12 +456,62 @@ pub fn query_all_branches(model: &str) -> Vec<Package> {
             let _ = h.join();
         }
     }
+    let soft = match found.get() {
+        Some(s) => Soft::Found(s.clone()),
+        // 有分支正常回包且确实没有这个字段，才算「官方没给这台机器项目号」
+        // （老机型的响应里根本没有 vabInfo，那是正常回话，只是没有项目号）；
+        // 26 个分支全都没回包，说明这一轮官方接口一直没正经回话，
+        // 那是「没查通」，不能当成「没有」。
+        None if conclusive.load(std::sync::atomic::Ordering::Relaxed) => Soft::Absent,
+        None => Soft::Unknown,
+    };
+    // 只有找到项目号才缓存；「没有」和「没查通」都留待下次重问。
+    cache_put(model, &soft);
     let mut out = match results.lock() {
         Ok(v) => v.clone(),
         Err(_) => Vec::new(),
     };
     out.sort_by(|a, b| a.branch.cmp(&b.branch));
-    out
+    (out, soft)
+}
+
+/// 这次响应算不算「服务器正常回话」。
+///
+/// 判据是 components 里有没有真包，而不是有没有 vabInfo：老机型（如 RMX1901）
+/// 正常响应里也压根没有 vabInfo 字段 —— 那正好说明官方没给它项目号，属于
+/// 「查有结论的没有」；只有连 components 都空掉的那种降级响应才算没查通。
+fn responded(data: &Value) -> bool {
+    data.get("components")
+        .and_then(|c| c.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+}
+
+/// 取出响应里的 vabInfo.data.header 数组；没有就返回 None
+fn header_of(data: &Value) -> Option<&Vec<Value>> {
+    data.get("components")?
+        .as_array()?
+        .first()?
+        .get("componentPackets")?
+        .get("vabInfo")?
+        .get("data")?
+        .get("header")?
+        .as_array()
+}
+
+/// 从一次 OTA 响应里取 `oplus_separate_soft`（5 位项目号）
+fn soft_in(data: &Value) -> Option<String> {
+    let header = header_of(data)?;
+    for item in header {
+        let Some(s) = item.as_str() else { continue };
+        if let Some(v) = s.strip_prefix("oplus_separate_soft=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// 顺着升级链一路往前走，把中间经过的版本都收下来
@@ -428,6 +559,19 @@ pub struct Merged {
     pub aftersale: Vec<Package>,
     /// 社区源是否用上了（未用上时界面不显示社区相关文案）
     pub community_ok: bool,
+    /// 售后通道这次的结果。列表为空时界面要靠它区分「本来没有」和「这次没查通」。
+    pub after_state: AfterState,
+}
+
+/// 售后通道的查询结局
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AfterState {
+    /// 查通了（包可能为 0 个，但查询本身有结果）
+    Ok,
+    /// 官方 OTA 里就没有 `oplus_separate_soft`：这台机器官方没提供售后包
+    NoProject,
+    /// 项目号或降级服务器这次没问出结果，不代表没有；值得再点一次「重新扫描」
+    Unknown,
 }
 
 /// 查询某机型的全量包：官方 A–Z 分支扫描 + 社区源版本清单，按版本号去重合并。
@@ -437,12 +581,31 @@ pub struct Merged {
 pub fn query_merged(code: &str, name: &str, brand: &str) -> Merged {
     // 分支扫描、升级链、社区源、售后源互不依赖，四条线同时跑；
     // 总耗时由最慢的那条决定，而不是四者相加。
+    let (soft_tx, soft_rx) = std::sync::mpsc::channel::<Soft>();
+
+    // 分支扫描顺带把项目号捞出来，通过 channel 交给售后那条线。
+    // 这样官方 OTA 每个机型只被打一遍：售后通道不再自己重复问一轮。
+    let branch_code = code.to_string();
+    let branches = std::thread::spawn(move || {
+        let (list, soft) = query_all_branches_harvest(&branch_code);
+        let _ = soft_tx.send(soft);
+        list
+    });
+
     let chain_code = code.to_string();
     let chain = std::thread::spawn(move || query_chain(&chain_code));
 
-    // 售后源要先查一次官方 OTA 拿项目号，本身又是一次网络往返，必须并行
+    // 售后源等分支扫描把项目号递过来。只有「递过来的结论是未知」或「等超时」
+    // 这两种情况才自己去问一次官方 OTA —— 那多半意味着官方接口这一轮整体降级了，
+    // 正是售后分区凭空消失的那一刻，值得用带多轮重试的独立查询兜一次底。
     let soft_code = code.to_string();
-    let aftersale = std::thread::spawn(move || crate::core::downgrade::query(&soft_code));
+    let aftersale = std::thread::spawn(move || {
+        let soft = match soft_rx.recv_timeout(Duration::from_secs(25)) {
+            Ok(Soft::Unknown) | Err(_) => separate_soft(&soft_code),
+            Ok(s) => s,
+        };
+        crate::core::downgrade::query_with(&soft_code, soft)
+    });
 
     let (vc, vn, vb) = (code.to_string(), name.to_string(), brand.to_string());
     let community = std::thread::spawn(move || {
@@ -450,7 +613,7 @@ pub fn query_merged(code: &str, name: &str, brand: &str) -> Merged {
         std::panic::catch_unwind(|| crate::core::violet::packages(&vc, &vn, &vb))
     });
 
-    let mut all = query_all_branches(code);
+    let mut all = branches.join().unwrap_or_default();
     let mut seen: std::collections::HashSet<String> = all.iter().map(|p| p.key()).collect();
     if let Ok(extra) = chain.join() {
         for p in extra {
@@ -484,10 +647,20 @@ pub fn query_merged(code: &str, name: &str, brand: &str) -> Merged {
     });
     // 售后包不参与上面的排序与去重：它们的版本号是 ColorOS 自己的号，
     // 和升级包不在同一个坐标系里，混排只会让列表看起来乱。
+    let after = aftersale
+        .join()
+        .unwrap_or_else(|_| crate::core::downgrade::AfterSale::unknown());
+    let after_state = match &after.soft {
+        Soft::Found(_) if !after.list.is_empty() => AfterState::Ok,
+        Soft::Found(_) => AfterState::Unknown,
+        Soft::Absent => AfterState::NoProject,
+        Soft::Unknown => AfterState::Unknown,
+    };
     Merged {
         packages: all,
-        aftersale: aftersale.join().unwrap_or_default(),
+        aftersale: after.list,
         community_ok,
+        after_state,
     }
 }
 

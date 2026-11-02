@@ -1,7 +1,7 @@
 //! 右侧：可用全量包列表
 use crate::app::format::{bytes, date};
 use crate::app::state::App;
-use crate::core::ota::{Package, Source};
+use crate::core::ota::{AfterState, Package, Source};
 use crate::core::theme::{self, P};
 use eframe::egui;
 
@@ -71,6 +71,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut App) {
                             ui.add_space(10.0);
                         }
                         ui.add_space(8.0);
+                    } else if app.after_state == AfterState::Unknown {
+                        // 没查到和没有是两回事：前者值得再点一次「重新扫描」，
+                        // 静默留白只会让人以为售后功能坏了。
+                        after_pending(ui);
                     }
                     if !app.packages.is_empty() {
                         section_label(ui, app.packages.len(), official);
@@ -263,6 +267,41 @@ fn after_label(ui: &mut egui::Ui, n: usize) {
          它的下载地址是长期有效的直链，续传不受签名过期影响。",
     );
     ui.add_space(9.0);
+}
+
+/// 售后通道本次没查通时的提示条。
+///
+/// 只在 `AfterState::Unknown` 时出现：`NoProject` 说明官方本来就没给这台机器
+/// 提供售后包，说一句「没有」就够了，不该给出「再试一次」的暗示。
+fn after_pending(ui: &mut egui::Ui) {
+    let w = ui.available_width() - PAD_X * 2.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 56.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, theme::CR_CARD, P::with_alpha(P::WARN, 12));
+    p.rect_stroke(
+        rect,
+        theme::CR_CARD,
+        egui::Stroke::new(1.0, P::with_alpha(P::WARN, 60)),
+        egui::StrokeKind::Inside,
+    );
+
+    let inner = rect.shrink2(egui::vec2(14.0, 0.0));
+    let cy = rect.center().y;
+    p.text(
+        egui::pos2(inner.left(), cy - 8.0),
+        egui::Align2::LEFT_CENTER,
+        "售后全量包这次没查到",
+        egui::FontId::proportional(12.6),
+        P::WARN,
+    );
+    p.text(
+        egui::pos2(inner.left(), cy + 10.0),
+        egui::Align2::LEFT_CENTER,
+        "OPPO 售后服务器偶发无响应，点右上角「重新扫描」多试一次通常就有了",
+        egui::FontId::proportional(10.8),
+        P::with_alpha(P::TEXT_DIM, 220),
+    );
+    ui.add_space(14.0);
 }
 
 // ---------------------------------------------------------------- 脚注

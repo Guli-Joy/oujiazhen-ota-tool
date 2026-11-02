@@ -23,7 +23,7 @@ src/app/             界面层：只消费 core 的结果，不直接发请求
   mod.rs             pub mod state / format / shell / views
   state.rs           App 状态机：查询、探测、下载、暂停、续传、历史、错误提示
   format.rs          bytes() / date() / dur() 纯格式化
-  shell.rs           在资源管理器中定位文件（COM STA 线程 + ShellExecuteW 回退）
+  shell.rs           在资源管理器中定位文件（COM STA 线程 + 父/子 PIDL + Win10/Win11 Shell 回退 + 按需 UAC helper）
   views/mod.rs       pub mod about / bottom / history / packages / sidebar / topbar
   views/topbar.rs    顶栏（logo、标题、「历史下载」「数据来源 · 致谢」入口）
   views/sidebar.rs   左侧机型搜索面板
@@ -127,7 +127,26 @@ src/app/             界面层：只消费 core 的结果，不直接发请求
 - **RSA 包裹的是 `base64(session_key)` 的字节**，不是裸 32 字节密钥；
 - **`deviceId` 必须是「已建档」的真实 DUID**（64 位大写十六进制，手机上 `*#6776#` 可查），传 64 个 `0` 会回 `code=1004 duid查询guid为空`；
 - 服务端约 1/3~1/2 概率抽风返回 500 `AES decrypt error`，重试 8 次内必成；
-- `otaVersion` 前缀与结果无关，服务器只认 `model + prjNum`（5 位项目号）。项目号从官方 OTA 响应的 `vabInfo.data.header` 里捞 `oplus_separate_soft=` 前缀的值。
+- `otaVersion` 前缀与结果无关，服务器只认 `model + prjNum`（5 位项目号）。
+- 降级服务器对 `model + prjNum` 做绑定校验：拿别的机型的项目号去查会被打回（`no list` 或 500），**项目号不能借用**。
+
+### 项目号为什么必须扫 A–Z 全部分支
+
+项目号不在降级服务器上，而在官方 OTA 响应的 `components[0].componentPackets.vabInfo.data.header` 数组里，形如 `oplus_separate_soft=23607`。它是两条协议之间唯一的桥。
+
+实测（`_build/tmp` 里的 Node 探针）踩过两个坑：
+
+1. **只试 6 个分支会漏掉一大半机型**。最初只用 `A / F / C / B / E / D` 去问，539 款机型里只有 215 款查到项目号，剩下 324 款判成「官方没给」。逐字母扫到 Z 之后，其中抽样的 143 款**全部**都查到了（0 款缺失）—— 老机型和平板的项目号往往躺在 H / J / L / M 这类分支下。所以 `query_all_branches_harvest()` 一次问遍 26 个字母，顺带把项目号捞出来（同一个响应两用，不必为售后通道再问一轮官方 OTA）。
+
+2. **「没有字段」不等于「没查通」**。判据必须是 `components` 数组非空（`fn responded()`），不能看有没有 `vabInfo`：老机型（如 RMX1901）的正常响应里**压根没有 `vabInfo` 字段**，那恰恰是「官方确实没给它项目号」这个有结论的答案；反过来，界面查询时的并发把官方接口打到降级，响应里连 `components` 都是空的 —— 那才是「这一轮没查通」。
+
+于是 `Soft` 分成三态：`Found(项目号)` / `Absent`（问到了，官方没有）/ `Unknown`（没问通）。这个区分一路传到界面：
+
+- `Found` 但降级服务器 8 次都被抽风打回 → 分区照常显示，提示「售后包这次没查到，可点重新扫描重试」；
+- `Absent` → 显示「该机型的官方数据里没有售后全量包」；
+- 售后列表非空 → 显示「另有 N 个售后全量包」。
+
+项目号只在 `Found` 时进内存缓存：坏结论不该被记住，否则用户重扫时拿到的是一个可能已经过期的「没有」。
 
 ### 售后包的版本号为什么要额外读 ZIP
 
