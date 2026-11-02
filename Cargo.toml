@@ -2,7 +2,15 @@
 name = "ota-tool"
 version = "1.0.0"
 edition = "2021"
-description = "OPPO / 真我 / 一加 全量包查询下载工具"
+description = "欧加真全量包下载工具 —— OPPO / 一加 / 真我 全量包检索、下载与校验"
+authors = ["Guli-Joy"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Guli-Joy/oujiazhen-ota-tool"
+homepage = "https://github.com/Guli-Joy/oujiazhen-ota-tool"
+readme = "README.md"
+keywords = ["oppo", "realme", "oneplus", "ota", "firmware"]
+categories = ["gui", "network-programming"]
+exclude = ["docs/screenshot-main.png"]
 
 [dependencies]
 eframe = "0.37"
