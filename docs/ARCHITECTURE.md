@@ -13,7 +13,7 @@ src/core/            核心层：无 egui 依赖，可单独测试
   mod.rs             pub mod download / downgrade / history / meta / ota / search / theme / violet
   search.rs          机型模糊搜索（纯函数）
   ota.rs             官方 OTA 协议 + Package 数据模型 + 来源枚举
-  violet.rs          社区源 VioletToolBox 客户端（公开 HTTP API）
+  violet.rs          社区源 VioletToolBox 客户端（公开 HTTP API；含社区售后包分桶与补齐）
   downgrade.rs       售后降级服务器客户端（AES-256-GCM + RSA-OAEP）
   meta.rs            从 ZIP 首部读 META-INF/com/android/metadata，补齐售后包真名
   download.rs        多线程分块下载 / 断点续传 / MD5 校验
@@ -57,15 +57,22 @@ src/app/             界面层：只消费 core 的结果，不直接发请求
      │                 从 A.01 起把响应里的 realOtaVersion 原样回送，最多 40 步
      │                 用 version_key 去重 → 补出分支扫描拿不到的中间历史版本
      │
-     └──────────────► 社区源：violet::find() + /versions
+     ├──────────────► 线程 C（与 A/B 并行）：售后降级服务器
+     │                 downgrade::query()：A–Z 扫描顺带捞到的项目号 → query-v3
+     │                 成功后 enrich()：每个包一次 Range 读 ZIP 首部 metadata
+     │
+     └──────────────► 线程 D：社区源：violet::find() + /versions
+                       packages() 拆成 Community { normal, after }
+                       enrich_after()：每个降级包换直链 + 读 ZIP 首部补大小/日期
                        std::panic::catch_unwind 包裹，失败则 community_ok = false
      │
      ▼
-  合并 Merged { packages, community_ok }
-     │  去重：version_key()（先按 "(" / "（" 截断，再取尾部数字与点）
-     │  排序：版本号倒序 → 官方优先于社区 → 字符串
+  合并 Merged { packages, aftersale, community_ok }
+     │  packages 去重：version_key()（先按 "(" / "（" 截断，再取尾部数字与点）
+     │  packages 排序：版本号倒序 → 官方优先于社区 → 字符串
+     │  aftersale：官方售后包在前 + 社区售后包在后，两路互不去重
      ▼
-[app/state.rs] 发布到 self.packages，状态栏汇总「官方 X 个，社区源补 Y 个」
+[app/state.rs] 发布到 self.packages / self.aftersale，状态栏「官方 X 个，社区源补 Y 个；另有 N 个售后全量包」
      │
      ├─► probe_community()：后台批量探测社区包链接是否仍可下（link_ok: Option<bool>）
      │
@@ -156,6 +163,21 @@ src/app/             界面层：只消费 core 的结果，不直接发请求
 
 > 注意：售后包的 `version_name` 可能与官方包**完全相同**（RMX3888 两者都是 `RMX3888_16.0.10.500(CN01)`，但售后 10.24 GB / 官方 8.76 GB）。所以落盘文件名给售后包加 `_售后` 后缀（`RMX3888_16.0.10.500(CN01)_售后.zip`），避免同名撞同一个 `.partstate` 位图。
 
+### 社区售后包为什么要单独分桶
+
+社区源的版本清单里混着一类名字带「降级包」后缀的条目（实测全库 41 条，标记词只有「降级包」这一种，另兼容「回退包 / 维修包 / 售后包」）。它们的版本号往往很旧（如 `RMX3888_14.1.0.804(CN01)`）：
+
+- 按普通版本合并进升级清单，会被当成「一个很老的升级包」，而它真正的用途是**刷回去**；
+- 直接丢掉，官方降级服务器没下发包的机型就彻底没有售后包可用。
+
+所以 `violet::packages()` 的返回类型是 `Community { normal, after }`，两个桶**各自按 `version_key` 去重**。必须分开的理由是实测出来的：8 个机型各有一条「降级包」与同机型某个普通版本的版本号**完全相同**（RMX3706 `14.0.0.903(CN01)`、RMX3700 `13.1.0.120(CN01)` 与 `14.0.0.903(CN01)`、RMX3300 `14.0.0.1410(CN01)`、RMX3551 `14.0.0.1410(CN01)`、RMX3820 `14.0.0.1120(CN01)`、RMX3823 `14.0.0.1120(CN01)`、RMX3841 `14.0.0.1501(CN01)`），但两者换出来的直链完全不同（普通包走 `gauss-componentotacostmanual-cn.allawnfs.com`，降级包走 `rbp01.realme.net` 的 `506_sign_*` / `ROLL_BACK_*`）—— 是两个不同的文件，用同一个桶去重必然丢一个。
+
+并入售后分区时**不与官方售后包互相去重**：官方卡的版本号读自包内 `version_name`，社区写的是它自己的版本名，字符串对不上，硬比只会把同一个包列两遍。宁可多一张卡，也不要让人以为「少了一个版本」。官方在前、社区在后 —— 官方直链长期有效且带 MD5，社区直链是当场签发的（约 10 分钟）。
+
+`enrich_after()` 负责补齐社区降级包的信息：逐个 `download_link()` 换取直链，再 `meta::fetch()` 一次 Range 同时取回 `content-range` 里的**总大小**与 ZIP 首部的 `post-timestamp` / `security_patch`。按 `chunks(3)` 三路并发而不是全展开 —— 社区源是免费公共服务，单机型通常也只有 1~3 个降级包，三路足够把往返压到一条链路的量级。换不出直链才置 `link_ok = Some(false)`（那才是真的失效）；换得出来但读不到首部只是补不全信息，仍然算活。
+
+**占位补丁日**：realme 有一部分包把 `security_patch` 写成 `2088-08-05` 这类明显虚构的值。`meta::sane_patch()` 对年份做 2010–2030 的合理性判断，超出范围直接丢弃 —— 卡片上宁可不显示，也不显示假日期。
+
 ## 4. 断点续传的位图格式
 
 进度文件与目标文件同目录、同名，后缀 `.partstate`：
@@ -180,10 +202,10 @@ src/app/             界面层：只消费 core 的结果，不直接发请求
 
 ## 5. 这样分层为什么便于扩展新来源
 
-要加第三个数据源（比如某个厂商的公开版本库），实际改动收敛在四点：
+现在已经有四条通道（官方 OTA / 升级链 / 官方售后 / 社区与社区售后），再加一个数据源（比如某个厂商的公开版本库）实际改动仍收敛在四点：
 
 1. **数据模型不动**：新来源只需产出与现有相同的 `Package`（`version / android / size / manual_url / published / security_patch / branch / md5 / ota_version / source / vio / link_ok / note`）。界面层拿到的永远是 `Vec<Package>`。
-2. **来源枚举加一支**：`Source` 加一个变体，实现 `label()` / `key()` / `tip()` 三个小函数，卡片角标、筛选、致谢文案自动跟上。
+2. **来源枚举加一支**：`Source` 加一个变体（现有 `Official / Community / AfterSale / AfterCommunity` 四支），实现 `label()` / `key()` / `tip()` 三个小函数，卡片角标、筛选、致谢文案自动跟上。注意 `match` 都是穷尽的：漏改任何一处编译器都会直接报出来，不会静默漏掉。
 3. **合并逻辑复用**：`query_merged` 已经把「多来源并行 → 归一化去重 → 排序」写成通用流程，新来源挂进去就是一个新的并行分支（并且和新来源失败时一样，用 `catch_unwind` 隔离，失败只降级不崩）。
 4. **下载器零改动**：下载只认「一个能换出新直链的闭包」`UrlGetter`（`Arc<dyn Fn() -> Result<String, String>>`）。官方包的闭包走 302 换签、社区包的闭包走 `/download-link` 接口，新来源只是提供第三个闭包实现——分块、重试、续传、校验全部照旧。
 

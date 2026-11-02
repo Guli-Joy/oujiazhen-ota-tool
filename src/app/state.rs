@@ -246,6 +246,8 @@ impl App {
         let refs: Vec<(String, violet::Ref)> = self
             .packages
             .iter()
+            // 社区降级包在查询阶段已经逐个换过直链并读过首部，
+            // 链接是否还活着当场就知道了，不必再探一遍。
             .filter(|p| p.source == Source::Community && p.vio.is_some())
             .map(|p| (p.key(), p.vio.clone().unwrap()))
             .collect();
@@ -426,6 +428,9 @@ impl App {
                                 Source::Community => {
                                     "社区源直链已复制（作者 Smart-Paocai），约 10 分钟内有效"
                                 }
+                                Source::AfterCommunity => {
+                                    "社区收录的售后直链已复制（作者 Smart-Paocai），约 10 分钟内有效"
+                                }
                                 Source::AfterSale => {
                                     "售后直链已复制，长期有效、支持断点续传"
                                 }
@@ -458,13 +463,11 @@ impl App {
         self.resolving = true;
         self.link = None;
         self.link_for = Some((pkg.id(), pkg.version.clone()));
-        let community = pkg.source == Source::Community;
         self.set(
             Tone::Info,
-            if community {
-                "正在向社区源换取下载直链…"
-            } else {
-                "正在向官方服务器解析直链…"
+            match pkg.source {
+                Source::Community | Source::AfterCommunity => "正在向社区源换取下载直链…",
+                _ => "正在向官方服务器解析直链…",
             },
         );
         let manual = pkg.manual_url.clone();
@@ -539,10 +542,13 @@ impl App {
     /// 就成了 RMX3888_RMX3888_...；所以只有版本号里还不含机型代号时才补。
     fn file_name_for(&self, pkg: &Package) -> String {
         let base = sanitize(&pkg.version);
-        if pkg.source == Source::AfterSale {
+        if matches!(pkg.source, Source::AfterSale | Source::AfterCommunity) {
             // 售后包和官方升级包可能是同一个 version_name（实测 RMX3888 两者都是
             // RMX3888_16.0.10.500(CN01)），但体积、MD5 完全不同（10.24 GB vs 8.76 GB）。
             // 同名会撞在同一个 .partstate 上，续传直接串块，必须从文件名上区分开。
+            //
+            // 社区收录的降级包同理：它的版本号也可能与清单里某个普通版本撞上
+            // （实测 RMX3706_14.0.0.903(CN01) 就有两个文件），一样要加后缀。
             return format!("{}_售后.zip", base);
         }
         format!("{}.zip", base)

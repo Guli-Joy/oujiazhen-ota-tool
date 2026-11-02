@@ -41,14 +41,23 @@ pub struct Meta {
 
 /// 读一个售后直链的包信息。任何一步不如预期都返回 None。
 pub fn read(url: &str) -> Option<Meta> {
-    let buf = fetch_head(url)?;
-    let text = find_metadata(&buf)?;
-    Some(parse(&text))
+    fetch(url).map(|(m, _)| m)
+}
+
+/// 一次 Range 请求同时拿到「包信息 + 文件总大小」。
+///
+/// 售后直链的内容是 ZIP，而 ZIP 里没有「我这个文件多大」的字段，所以大小只能
+/// 从响应的 content-range 里读。既然 metadata 本来就要发一次请求，就合并成一次，
+/// 别为同一个地址打两次网络往返。
+pub fn fetch(url: &str) -> Option<(Meta, u64)> {
+    let (buf, size) = fetch_head(url)?;
+    let meta = find_metadata(&buf).map(|t| parse(&t)).unwrap_or_default();
+    Some((meta, size))
 }
 
 /// 只取前 64 KB。服务器若忽略 Range 直接回 200 全量，take() 也会在第 64 KB 截断，
 /// 不会因为一个 8 GB 的包把内存吃光。
-fn fetch_head(url: &str) -> Option<Vec<u8>> {
+fn fetch_head(url: &str) -> Option<(Vec<u8>, u64)> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(15))
@@ -58,12 +67,19 @@ fn fetch_head(url: &str) -> Option<Vec<u8>> {
         .set("Range", &format!("bytes=0-{}", PREFIX_LEN - 1))
         .call()
         .ok()?;
+    // content-range 形如 "bytes 0-65535/8336370448"，斜杠后面就是总大小
+    let size = resp
+        .header("content-range")
+        .and_then(|cr| cr.rsplit('/').next().map(|s| s.trim().to_string()))
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(0);
     let mut buf = Vec::with_capacity(PREFIX_LEN as usize);
     resp.into_reader()
         .take(PREFIX_LEN)
         .read_to_end(&mut buf)
         .ok()?;
-    Some(buf)
+    Some((buf, size))
 }
 
 /// 在前缀里按顺序走一遍本地文件头，找到 metadata 条目并取回它的内容。
@@ -113,6 +129,15 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// 补丁日期是否可信：年份落在 2010~2030 之外的一律当占位值丢掉。
+fn sane_patch(v: &str) -> bool {
+    v.split('-')
+        .next()
+        .and_then(|y| y.parse::<u32>().ok())
+        .map(|y| (2010..=2030).contains(&y))
+        .unwrap_or(false)
+}
+
 /// metadata 是纯文本 key=value（换行分隔），按行切即可，不需要真的反序列化。
 fn parse(text: &str) -> Meta {
     let mut m = Meta::default();
@@ -136,9 +161,12 @@ fn parse(text: &str) -> Meta {
             "android_version" if m.android.is_empty() => {
                 m.android = format!("Android {}", v)
             }
-            // post-security-patch-level 与 security_patch 等价，前者是 A/B 包的惯例字段
+            // post-security-patch-level 与 security_patch 等价，前者是 A/B 包的惯例字段。
+            // realme 有一部分包的补丁日期是 "2088-08-05" 这种占位值，直接显示等于骗人，丢掉。
             "security_patch" | "post-security-patch-level" if m.security_patch.is_empty() => {
-                m.security_patch = v.to_string()
+                if sane_patch(v) {
+                    m.security_patch = v.to_string();
+                }
             }
             // 服务器给的 publishedTime 是「此刻」，每次请求都变；这个才是真正的构建时间
             "post-timestamp" if m.published.is_empty() => {

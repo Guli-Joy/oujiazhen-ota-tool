@@ -25,6 +25,8 @@ pub enum Source {
     Community,
     /// 售后（降级 / 维修）包：独立的 ColorOS 降级服务器
     AfterSale,
+    /// 社区源收录的降级 / 回退包：直链由第三方站点签发
+    AfterCommunity,
 }
 
 impl Source {
@@ -34,6 +36,7 @@ impl Source {
             Source::Official => "官方",
             Source::Community => "社区",
             Source::AfterSale => "售后",
+            Source::AfterCommunity => "社区售后",
         }
     }
 
@@ -43,6 +46,7 @@ impl Source {
             Source::Official => "official",
             Source::Community => "community",
             Source::AfterSale => "aftersale",
+            Source::AfterCommunity => "after-community",
         }
     }
 
@@ -52,6 +56,7 @@ impl Source {
             Source::Official => "版本与直链均由 OPPO 官方 OTA 服务器返回",
             Source::Community => "版本清单来自 VioletToolBox（作者 Smart-Paocai，GNU GPL v3.0）\nhttps://github.com/Smart-Paocai/VioletToolBox\n本工具仅调用其公开接口，未复制其源代码",
             Source::AfterSale => "售后（降级 / 维修）全量包，由 ColorOS 官方降级服务器签发\ndowngrade.coloros.com\n用于系统降级或售后维修刷机，直链长期有效、支持断点续传",
+            Source::AfterCommunity => "售后降级包，由 VioletToolBox（作者 Smart-Paocai，GNU GPL v3.0）收录\nhttps://github.com/Smart-Paocai/VioletToolBox\n官方售后服务器没下发的机型，可以在这里找找；直链由第三方站点签发，约 10 分钟内有效",
         }
     }
 }
@@ -610,7 +615,13 @@ pub fn query_merged(code: &str, name: &str, brand: &str) -> Merged {
     let (vc, vn, vb) = (code.to_string(), name.to_string(), brand.to_string());
     let community = std::thread::spawn(move || {
         // 社区源是第三方站点，页面结构随时可能变；它 panic 了不能拖垮整个查询
-        std::panic::catch_unwind(|| crate::core::violet::packages(&vc, &vn, &vb))
+        std::panic::catch_unwind(|| {
+            let mut c = crate::core::violet::packages(&vc, &vn, &vb);
+            // 降级包补体积/日期要逐个换直链，放在这条线程里做，
+            // 免得它拖慢主线程已经算完的版本清单。
+            c.after = crate::core::violet::enrich_after(std::mem::take(&mut c.after));
+            c
+        })
     });
 
     let mut all = branches.join().unwrap_or_default();
@@ -627,9 +638,12 @@ pub fn query_merged(code: &str, name: &str, brand: &str) -> Merged {
         .join()
         .ok()
         .and_then(|r| r.ok())
-        .unwrap_or_default();
-    let community_ok = !community.is_empty();
-    for p in community {
+        .unwrap_or_else(|| crate::core::violet::Community {
+            normal: Vec::new(),
+            after: Vec::new(),
+        });
+    let community_ok = !community.normal.is_empty() || !community.after.is_empty();
+    for p in community.normal {
         if seen.insert(p.key()) {
             all.push(p);
         }
@@ -647,15 +661,26 @@ pub fn query_merged(code: &str, name: &str, brand: &str) -> Merged {
     });
     // 售后包不参与上面的排序与去重：它们的版本号是 ColorOS 自己的号，
     // 和升级包不在同一个坐标系里，混排只会让列表看起来乱。
-    let after = aftersale
+    let mut after = aftersale
         .join()
         .unwrap_or_else(|_| crate::core::downgrade::AfterSale::unknown());
     let after_state = match &after.soft {
         Soft::Found(_) if !after.list.is_empty() => AfterState::Ok,
+        // 官方一条都没有、社区源却有：不是「没查到」，是被社区源补上了
+        _ if !community.after.is_empty() => AfterState::Ok,
         Soft::Found(_) => AfterState::Unknown,
         Soft::Absent => AfterState::NoProject,
         Soft::Unknown => AfterState::Unknown,
     };
+
+    // 社区源的降级包并进同一个分区，但排在官方之后：
+    // 官方直链长期有效、带 MD5，社区直链 10 分钟就过期，先给用户更好的那个。
+    //
+    // 去重只在社区内部做，不和官方比对：官方售后包的版本号来自 ZIP 里的
+    // version_name，社区写的是它自己的版本名，两者字符串对不上，硬比会把
+    // 同一个包列两遍。宁可多一张卡，也不要让人以为「少了一个版本」。
+    after.list.extend(community.after);
+
     Merged {
         packages: all,
         aftersale: after.list,

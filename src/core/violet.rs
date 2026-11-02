@@ -8,6 +8,7 @@
 //! 本模块只调用上述服务的公开 HTTP 接口（无需鉴权、无需登录），
 //! 不复制、不修改、不分发其源代码，仅转发查询版本清单与下载地址。
 
+use crate::core::meta;
 use crate::core::ota::{self, Package, Source};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -286,6 +287,16 @@ pub fn find(code: &str, name: &str, brand: &str) -> Vec<Device> {
 
 // ---------------------------------------------------------------- 版本与直链
 
+/// 社区源用中文词标注包的用途。实测全库只有「降级包」一种写法，
+/// 同类词也一并认下：对方哪天换了说法，不至于把降级包当成普通版本混进清单。
+const AFTER_MARKS: [&str; 4] = ["降级包", "回退包", "维修包", "售后包"];
+
+/// 版本名里是否带「这是降级包」的标记
+fn after_mark(raw: &str) -> bool {
+    raw.split_whitespace()
+        .any(|t| AFTER_MARKS.iter().any(|m| t == *m))
+}
+
 /// 把社区源的版本名拆成「展示名 + 分支字母」
 ///
 /// 实测三种形态：带 RealmeUI 前缀与分支后缀的、纯版本号的、尾部标「降级包」的。
@@ -310,7 +321,7 @@ fn split_branch(raw: &str) -> (String, String) {
         if is_branch {
             branch = last[..1].to_string();
             s = t[..t.len() - last.len()].trim_end().to_string();
-        } else if last == "降级包" {
+        } else if after_mark(&last) {
             s = t[..t.len() - last.len()].trim_end().to_string();
         } else {
             break;
@@ -348,22 +359,49 @@ fn versions(a: &ureq::Agent, d: &Device) -> Vec<String> {
     get_names(a, &url).unwrap_or_default()
 }
 
-/// 查该机型在社区源里的全部版本，转成统一的 Package 列表
-pub fn packages(code: &str, name: &str, brand: &str) -> Vec<Package> {
+/// 社区源查到的两类包
+///
+/// 降级包必须单独收：它的版本号常常是旧的（RMX3888_14.1.0.804(CN01)），
+/// 混进普通清单会被当成「一个很老的升级包」，而它真正的身份是「能刷回去的
+/// 降级包」，用法完全不同 —— 就像官方售后包那样，必须另立分区。
+pub struct Community {
+    /// 普通版本清单
+    pub normal: Vec<Package>,
+    /// 标注为降级 / 回退的包
+    pub after: Vec<Package>,
+}
+
+/// 查该机型在社区源里的全部版本，拆成普通清单与降级包两部分
+pub fn packages(code: &str, name: &str, brand: &str) -> Community {
+    let mut out = Community {
+        normal: Vec::new(),
+        after: Vec::new(),
+    };
     let devs = find(code, name, brand);
     if devs.is_empty() {
-        return Vec::new();
+        return out;
     }
     let a = agent();
-    let mut out = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    // 两个桶各自去重：同一个版本号可能既有普通包又有降级包，
+    // 它们是两个不同的文件，不能互相顶掉。
+    let mut seen_normal: HashSet<String> = HashSet::new();
+    let mut seen_after: HashSet<String> = HashSet::new();
     for d in &devs {
         for raw in versions(&a, d) {
+            let is_after = after_mark(&raw);
             let (disp, branch) = split_branch(&raw);
-            if disp.is_empty() || !seen.insert(ota::version_key(&disp)) {
+            if disp.is_empty() {
                 continue;
             }
-            out.push(Package {
+            let dup = if is_after {
+                !seen_after.insert(ota::version_key(&disp))
+            } else {
+                !seen_normal.insert(ota::version_key(&disp))
+            };
+            if dup {
+                continue;
+            }
+            let pkg = Package {
                 android: android_of(&disp),
                 version: disp,
                 size: 0,
@@ -373,7 +411,13 @@ pub fn packages(code: &str, name: &str, brand: &str) -> Vec<Package> {
                 branch,
                 md5: String::new(),
                 ota_version: String::new(),
-                source: Source::Community,
+                source: if is_after {
+                    Source::AfterCommunity
+                } else {
+                    Source::Community
+                },
+                // 换直链必须回传原始版本名（带「降级包」后缀那个），
+                // 拆过的展示名它不认。
                 vio: Some(Ref {
                     brand: d.brand.clone(),
                     series: d.series.clone(),
@@ -382,10 +426,80 @@ pub fn packages(code: &str, name: &str, brand: &str) -> Vec<Package> {
                 }),
                 link_ok: None,
                 note: String::new(),
-            });
+            };
+            if is_after {
+                out.after.push(pkg);
+            } else {
+                out.normal.push(pkg);
+            }
         }
     }
     out
+}
+
+/// 给社区降级包补上「体积 / 发布日 / 补丁」这三项它自己不给的信息。
+///
+/// 社区源的版本接口只有名字，卡片上「大小」一栏会一直写着「未知」，
+/// 和官方售后卡摆在一起非常割裂。降级包的地址换出来之后是裸 CDN 直链，
+/// 发一次 Range 就能拿到 content-range 里的总大小，顺手还能读到 ZIP 首部的
+/// META-INF/com/android/metadata 补齐发布日与补丁日。
+///
+/// 补不出来就保持原样：这一步只影响显示，绝不能因为它失败就不给下载。
+pub fn enrich_after(list: Vec<Package>) -> Vec<Package> {
+    let mut out = Vec::with_capacity(list.len());
+    // 三路并发而不是全展开：社区源是免费公共服务，一次打几十个请求容易被限流，
+    // 单机型通常也就 1~3 个降级包，三路足够把往返时间压到一条链路的量级。
+    for chunk in list.chunks(3) {
+        let done: Vec<Package> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .cloned()
+                .map(|mut p| {
+                    s.spawn(move || {
+                        fill_after(&mut p);
+                        p
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .enumerate()
+                .map(|(i, h)| h.join().unwrap_or_else(|_| chunk[i].clone()))
+                .collect()
+        });
+        out.extend(done);
+    }
+    out
+}
+
+/// 单个社区降级包的补齐：换直链 → 取首部 → 填字段
+fn fill_after(pkg: &mut Package) {
+    let Some(r) = pkg.vio.clone() else {
+        return;
+    };
+    let Ok(url) = download_link(&r) else {
+        // 换不出直链才真的是「链接已失效」；能换出来但读不到首部只是补不全信息
+        pkg.link_ok = Some(false);
+        return;
+    };
+    let Some((m, size)) = meta::fetch(&url) else {
+        // 首部读不到时退一步：只要 HEAD/Range 能拿到长度，就说明链接还活着
+        pkg.size = fetch_size(&url).unwrap_or(pkg.size);
+        pkg.link_ok = Some(pkg.size > 0);
+        return;
+    };
+    if size > 0 {
+        pkg.size = size;
+    }
+    if !m.published.is_empty() {
+        pkg.published = m.published;
+    }
+    if !m.security_patch.is_empty() {
+        pkg.security_patch = m.security_patch;
+    }
+    // 版本名与分支沿用社区源自己的写法：社区用点分（RMX3300_11.C.16），
+    // 而 ZIP 里记的是下划线分（RMX3300_11_C.16），界面上前者更像官网的写法。
+    pkg.link_ok = Some(true);
 }
 
 /// 用四元组换一条签名直链（有效期约 10 分钟，不能预存）

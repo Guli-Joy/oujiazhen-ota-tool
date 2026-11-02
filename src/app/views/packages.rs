@@ -478,6 +478,9 @@ fn card(ui: &mut egui::Ui, app: &App, pkg: &Package, latest: bool) -> Option<Act
                                 Source::Official => P::TEXT_FAINT,
                                 Source::Community => P::VIOLET,
                                 Source::AfterSale => P::WARN,
+                                // 社区收录的售后包同时属于两类，取售后那一路的暖色，
+                                // 让它在售后分区里与官方售后卡同色系，不打断阅读。
+                                Source::AfterCommunity => P::WARN,
                             };
                             theme::soft_pill(ui, pkg.source.label(), sc)
                                 .on_hover_text(pkg.source.tip());
@@ -563,6 +566,9 @@ fn card(ui: &mut egui::Ui, app: &App, pkg: &Package, latest: bool) -> Option<Act
                         (true, Some(Source::AfterSale)) => {
                             "已复制到剪贴板 · 售后直链长期有效，可直接粘给下载器"
                         }
+                        (true, Some(Source::AfterCommunity)) => {
+                            "已复制到剪贴板 · 社区收录的售后直链，约 10 分钟内有效"
+                        }
                         (true, Some(Source::Community)) => {
                             "已复制到剪贴板 · 社区源直链，约 10 分钟内有效"
                         }
@@ -572,6 +578,9 @@ fn card(ui: &mut egui::Ui, app: &App, pkg: &Package, latest: bool) -> Option<Act
                         (true, None) => "已复制到剪贴板",
                         (false, _) if pkg.source == Source::AfterSale => {
                             "售后直链长期有效，点一下复制到剪贴板"
+                        }
+                        (false, _) if pkg.source == Source::AfterCommunity => {
+                            "向社区源换取售后直链并复制（约 10 分钟有效）"
                         }
                         _ => "解析官方直链并复制到剪贴板（约 10 分钟有效）",
                     };

@@ -177,7 +177,10 @@ fn row(ui: &mut egui::Ui, app: &mut App, e: &history::Entry) {
                         }
                         theme::soft_pill(ui, e.status.label(), color);
                         if e.pkg.source != Source::Official {
-                            let c = if e.pkg.source == Source::AfterSale {
+                            let c = if matches!(
+                                e.pkg.source,
+                                Source::AfterSale | Source::AfterCommunity
+                            ) {
                                 P::WARN
                             } else {
                                 P::VIOLET
