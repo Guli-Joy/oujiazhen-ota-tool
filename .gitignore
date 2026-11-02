@@ -1,0 +1,32 @@
+# ---- Rust 构建产物 ----
+/target
+**/*.rs.bk
+*.pdb
+
+# ---- 构建 / 打包产物 ----
+build/
+dist/
+*.exe
+*.msi
+*.dll
+*.lib
+*.exp
+*.zip
+
+# ---- 本程序的运行时文件（下载中的临时进度位图）----
+*.partstate
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 明确保留 ----
+# Cargo.lock 必须提交：这是可执行程序（bin），锁文件保证可复现构建。
+!Cargo.lock
+# .cargo/config.toml 必须提交：里面有 -C target-feature=+crt-static（静态 CRT）。
+!.cargo/config.toml
