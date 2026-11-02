@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](#许可证)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](#快速开始)
 [![Language](https://img.shields.io/badge/language-Rust%202021-DEA584.svg)](#构建说明)
-[![Version](https://img.shields.io/badge/version-1.0.2-brightgreen.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.0.3-brightgreen.svg)](CHANGELOG.md)
 
 ---
 
