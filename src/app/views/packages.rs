@@ -21,6 +21,11 @@ enum Act {
     Download(Package),
     Resume,
     ResolveLink(Package),
+    /// 展开 / 收起售后全量包。
+    ///
+    /// 售后通道一个机型能给三十多个包，全铺开会把下面「可用全量包」推出屏幕，
+    /// 所以默认只露前几张，其余折起来等用户点开。
+    ToggleAfter,
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut App) {
@@ -63,8 +68,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut App) {
                     // 售后全量包放在最前：它通常只有 1~2 个，而升级包动辄二十几个，
                     // 排在二十多张卡后面等于藏起来了（1180x820 下一屏只放得下 3 张）。
                     if !app.aftersale.is_empty() {
-                        after_label(ui, app.aftersale.len());
-                        for pkg in app.aftersale.iter() {
+                        let shown = app.after_visible();
+                        if let Some(a) =
+                            after_label(ui, app.aftersale.len(), app.after_open, shown.len())
+                        {
+                            acts.push(a);
+                        }
+                        for pkg in app.after_visible().iter() {
                             if let Some(a) = card(ui, app, pkg, false) {
                                 acts.push(a);
                             }
@@ -125,6 +135,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut App) {
             Act::Download(pkg) => app.start_download(&pkg),
             Act::Resume => app.resume_download(),
             Act::ResolveLink(pkg) => app.resolve_link(&pkg),
+            Act::ToggleAfter => app.toggle_after(),
         }
     }
 }
@@ -236,8 +247,8 @@ fn section_label(ui: &mut egui::Ui, n: usize, official: usize) {
 /// 单独成段而不是混进版本清单：这些包的版本号是 ColorOS 自己的号
 /// （ColorOS16.1.0），和升级包的「16.0.10.500」不在一个坐标系里，
 /// 混排会让「按版本号倒序」这个承诺失效。
-fn after_label(ui: &mut egui::Ui, n: usize) {
-    ui.horizontal(|ui| {
+fn after_label(ui: &mut egui::Ui, n: usize, open: bool, shown: usize) -> Option<Act> {
+    let out = ui.horizontal(|ui| {
         ui.add_space(PAD_X);
         ui.label(
             egui::RichText::new("售后全量包")
@@ -251,6 +262,7 @@ fn after_label(ui: &mut egui::Ui, n: usize) {
                 .size(10.8)
                 .color(P::with_alpha(P::WARN, 210)),
         );
+        let mut act = None;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(PAD_X);
             ui.label(
@@ -258,15 +270,30 @@ fn after_label(ui: &mut egui::Ui, n: usize) {
                     .size(10.8)
                     .color(P::with_alpha(P::TEXT_FAINT, 200)),
             );
+            if n > shown || open {
+                ui.add_space(10.0);
+                let text = if open {
+                    "收起".to_string()
+                } else {
+                    format!("展开全部 {}", n)
+                };
+                if theme::ghost_button_off_min(ui, &text, if open { 52.0 } else { 86.0 }).clicked() {
+                    act = Some(Act::ToggleAfter);
+                }
+            }
         });
-    })
-    .response
-    .on_hover_text(
-        "售后全量包（降级 / 维修用完整固件），来自 OPPO 售后降级服务器。\n\
+        act
+    });
+    out.response.on_hover_text(
+        "售后全量包（降级 / 维修用完整固件），两个来源：\n\
+         · 官方：OPPO 售后降级服务器按项目号下发，地址长期有效\n\
+         · 社区：VioletToolBox 的售后包通道（角标「社区售后」），\n\
+           一个机型常有三十多个版本，官方没下发降级包的机型靠它兜底\n\
          与升级包不是同一套版本序列，所以单独列出、不参与版本号排序。\n\
-         它的下载地址是长期有效的直链，续传不受签名过期影响。",
+         线刷包（OFP）要用 EDL 工具走 9008 刷入，系统更新里刷不了。",
     );
     ui.add_space(9.0);
+    out.inner
 }
 
 /// 售后通道本次没查通时的提示条。
@@ -310,7 +337,7 @@ fn footer(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.add_space(PAD_X);
         ui.label(
-            egui::RichText::new("版本清单：OPPO 官方 OTA + VioletToolBox 社区库 + OPPO 售后降级服务器")
+            egui::RichText::new("版本清单：OPPO 官方 OTA + VioletToolBox 社区库 + 售后通道")
                 .size(10.8)
                 .color(P::with_alpha(P::TEXT_FAINT, 205)),
         )
@@ -318,12 +345,15 @@ fn footer(ui: &mut egui::Ui) {
             "官方源：OPPO 服务器返回的版本与直链。\n\
              社区源：VioletToolBox，作者 Smart-Paocai，GNU GPL v3.0\n\
              https://github.com/Smart-Paocai/VioletToolBox\n\
-             售后源：OPPO 售后降级服务器 downgrade.coloros.com（维修站固件）\n\
+             售后源：OPPO 售后降级服务器 downgrade.coloros.com（维修站固件，长期直链）\n\
+             社区售后源：VioletToolBox 的 afterSales 通道（EDL 线刷包与 A/B 全量包）\n\
              本工具仅调用上述公开接口，未复制任何第三方源代码。",
         );
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new("· 直链有效期约 10 分钟 · 下载后可核对 MD5")
+            // 官方签名链 10 分钟；社区与售后给的是长期裸链，统称「有效期」会讲错，
+            // 所以只对官方那一类说时间，其余劝一句「失效就再点一次」。
+            egui::RichText::new("· 官方直链约 10 分钟有效 · 失效就再点一次 · 下载后可核对 MD5")
                 .size(10.8)
                 .color(P::with_alpha(P::TEXT_FAINT, 170)),
         );
@@ -489,6 +519,19 @@ fn card(ui: &mut egui::Ui, app: &App, pkg: &Package, latest: bool) -> Option<Act
                                 theme::soft_pill(ui, &pkg.note, P::WARN)
                                     .on_hover_text("售后服务器标注的包用途");
                             }
+                            // 封装形态：线刷包丢进系统更新里是刷不进去的，
+                            // 必须在下载之前就让人看见。
+                            if pkg.pack == crate::core::meta::Pack::Ofp {
+                                theme::soft_pill(ui, pkg.pack.label(), P::DANGER)
+                                    .on_hover_text(pkg.pack.tip());
+                            } else if pkg.pack == crate::core::meta::Pack::Ab
+                                && pkg.source == Source::AfterCommunity
+                            {
+                                // 社区售后卡两路混在一起，AB 也要标出来才好选；
+                                // 官方卡本来就是 AB，标了反而噪音。
+                                theme::soft_pill(ui, pkg.pack.label(), P::TEXT_DIM)
+                                    .on_hover_text(pkg.pack.tip());
+                            }
                             if latest {
                                 ui.add_space(1.0);
                                 theme::soft_pill(ui, "最新", P::OK);
@@ -567,7 +610,7 @@ fn card(ui: &mut egui::Ui, app: &App, pkg: &Package, latest: bool) -> Option<Act
                             "已复制到剪贴板 · 售后直链长期有效，可直接粘给下载器"
                         }
                         (true, Some(Source::AfterCommunity)) => {
-                            "已复制到剪贴板 · 社区收录的售后直链，约 10 分钟内有效"
+                            "已复制到剪贴板 · 社区收录的售后直链（失效就再点一次）"
                         }
                         (true, Some(Source::Community)) => {
                             "已复制到剪贴板 · 社区源直链，约 10 分钟内有效"
@@ -580,7 +623,7 @@ fn card(ui: &mut egui::Ui, app: &App, pkg: &Package, latest: bool) -> Option<Act
                             "售后直链长期有效，点一下复制到剪贴板"
                         }
                         (false, _) if pkg.source == Source::AfterCommunity => {
-                            "向社区源换取售后直链并复制（约 10 分钟有效）"
+                            "向社区源换取售后直链并复制"
                         }
                         _ => "解析官方直链并复制到剪贴板（约 10 分钟有效）",
                     };

@@ -10,6 +10,11 @@
 //! 比让界面显示一个毫无区分度的大版本号划算得多。
 //!
 //! 读不到就当没有：售后包照旧按服务器给的信息显示，绝不让这一步把整次查询拖垮。
+//!
+//! 除了 metadata，首部还能回答另一个要命的问题：这个 ZIP 到底是 A/B 全量包
+//! 还是 OFP / EDL 线刷包。两者的刷入方式完全不同（一个走系统更新 / recovery，
+//! 一个必须用 EDL 工具走 9008），卡片上不写清楚等于让人拿错包。
+//! 判断依据同样是首部条目名，一次 Range 就够，见 [`pack_of`]。
 
 use std::io::Read;
 use std::time::Duration;
@@ -23,6 +28,46 @@ const META_NAME: &str = "META-INF/com/android/metadata";
 
 /// ZIP 本地文件头签名
 const SIG: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
+
+/// 这个 ZIP 属于哪一类固件
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum Pack {
+    /// 认不出：既不像 A/B 全量包，也不像线刷包
+    #[default]
+    Unknown,
+    /// A/B 全量包：system 更新 / recovery sideload 用的那种
+    Ab,
+    /// OFP / EDL 线刷包：必须用 EDL 工具走 9008 刷入
+    Ofp,
+}
+
+impl Pack {
+    /// 卡片上的角标文案
+    pub fn label(self) -> &'static str {
+        match self {
+            Pack::Ab => "AB 全量包",
+            Pack::Ofp => "线刷包 OFP",
+            Pack::Unknown => "",
+        }
+    }
+
+    /// 悬停说明：为什么用户得在意这个区别
+    pub fn tip(self) -> &'static str {
+        match self {
+            Pack::Ab => "A/B 全量包，可在系统更新里本地升级 / recovery 侧载；\n本工具只负责下载，不改动任何分区",
+            Pack::Ofp => "OFP / EDL 线刷包，需要用 EDL 工具走 9008 端口刷入；\n普通升级流程刷不了它，别拿错",
+            Pack::Unknown => "",
+        }
+    }
+}
+
+/// 一次 Range 请求拿到的「首部 64 KB + 文件总大小」
+pub struct Head {
+    /// 文件前 64 KB
+    pub buf: Vec<u8>,
+    /// 文件总字节数（来自 content-range，取不到时为 0）
+    pub size: u64,
+}
 
 /// 从 metadata 里挑出来的、界面用得上的字段
 #[derive(Clone, Default)]
@@ -50,9 +95,44 @@ pub fn read(url: &str) -> Option<Meta> {
 /// 从响应的 content-range 里读。既然 metadata 本来就要发一次请求，就合并成一次，
 /// 别为同一个地址打两次网络往返。
 pub fn fetch(url: &str) -> Option<(Meta, u64)> {
+    let h = head(url)?;
+    let meta = find_metadata(&h.buf).map(|t| parse(&t)).unwrap_or_default();
+    Some((meta, h.size))
+}
+
+/// 只取文件首部（64 KB）与总大小。用在 afterSales 这类「没有 metadata、
+/// 但必须知道是 AB 还是 OFP」的包上。
+pub fn head(url: &str) -> Option<Head> {
     let (buf, size) = fetch_head(url)?;
-    let meta = find_metadata(&buf).map(|t| parse(&t)).unwrap_or_default();
-    Some((meta, size))
+    Some(Head { buf, size })
+}
+
+/// 从首部条目名判断这是 AB 全量包还是 OFP 线刷包。
+///
+/// 实测（RMX3706 / RMX3888 共 31+35 个包，全中）：
+/// - AB：`PRODUCT/`、`MY_MANIFEST/`、`version_info.txt`、`payload.bin`
+/// - OFP：`ofp_version.txt`、`IMAGES/`、`rawprogram*`、`copy_ofp_to_local.bat`
+///
+/// 前 64 KB 里最多排着十来个条目头，条目名是明文，直接找子串就够，
+/// 不需要真的走一遍 ZIP 结构。
+pub fn pack_of(buf: &[u8]) -> Pack {
+    if has(buf, b"ofp_version.txt") || has(buf, b"rawprogram") || has(buf, b"copy_ofp_to_local") {
+        return Pack::Ofp;
+    }
+    if has(buf, b"MY_MANIFEST") || has(buf, b"payload.bin") || has(buf, b"META-INF/com/android/metadata")
+    {
+        return Pack::Ab;
+    }
+    // 没有标志性条目时退一步看 `PRODUCT/`：新版 AB 包首个条目就是它，
+    // 但单独用它不够可靠（OFP 包里也有同名目录），所以排在最后。
+    if has(buf, b"PRODUCT/") {
+        return Pack::Ab;
+    }
+    Pack::Unknown
+}
+
+fn has(hay: &[u8], needle: &[u8]) -> bool {
+    find(hay, needle).is_some()
 }
 
 /// 只取前 64 KB。服务器若忽略 Range 直接回 200 全量，take() 也会在第 64 KB 截断，

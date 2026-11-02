@@ -61,16 +61,20 @@ src/app/             界面层：只消费 core 的结果，不直接发请求
      │                 downgrade::query()：A–Z 扫描顺带捞到的项目号 → query-v3
      │                 成功后 enrich()：每个包一次 Range 读 ZIP 首部 metadata
      │
-     └──────────────► 线程 D：社区源：violet::find() + /versions
-                       packages() 拆成 Community { normal, after }
-                       enrich_after()：每个降级包换直链 + 读 ZIP 首部补大小/日期
-                       std::panic::catch_unwind 包裹，失败则 community_ok = false
+     ├──────────────► 线程 D：社区源：violet::find() + /versions
+     │                 packages() 拆成 Community { normal, after }
+     │                 enrich_after()：每个降级包换直链 + 读 ZIP 首部补大小/日期
+     │                 std::panic::catch_unwind 包裹，失败则 community_ok = false
+     │
+     └──────────────► 线程 E：社区源售后通道 afterSales（与 D 并行，单独一个线程）
+                       after_sales() 查 afterSales 清单，量很大（一个机型常有 30+ 条）
+                       enrich_as()：换直链 + 读 ZIP 首部，同时判 AB / OFP 封装形态
      │
      ▼
   合并 Merged { packages, aftersale, community_ok }
      │  packages 去重：version_key()（先按 "(" / "（" 截断，再取尾部数字与点）
      │  packages 排序：版本号倒序 → 官方优先于社区 → 字符串
-     │  aftersale：官方售后包在前 + 社区售后包在后，两路互不去重
+     │  aftersale：官方售后包在前 + 社区售后两批在后，三路互不去重
      ▼
 [app/state.rs] 发布到 self.packages / self.aftersale，状态栏「官方 X 个，社区源补 Y 个；另有 N 个售后全量包」
      │
@@ -178,6 +182,30 @@ src/app/             界面层：只消费 core 的结果，不直接发请求
 
 **占位补丁日**：realme 有一部分包把 `security_patch` 写成 `2088-08-05` 这类明显虚构的值。`meta::sane_patch()` 对年份做 2010–2030 的合理性判断，超出范围直接丢弃 —— 卡片上宁可不显示，也不显示假日期。
 
+### 社区售后通道与封装形态
+
+社区源除了「常规版本清单」，还有一条**售后通道**（接口里的 `afterSales`）。它是同一个服务的另一套接口，同一个机型在两边是**完全不同的两批文件**，必须分别查：常规清单里带「降级包」后缀的条目实测全库只有 41 条，而售后通道一个机型就能给三十多条（`RMX3706` 34 个、`RMX3888` 2 个）。
+
+因为量大，它在 `query_merged` 里**单开一条线程**（线程 E），不与常规清单线程（D）串行，也不让分支扫描等它。
+
+这批包的封装分两类，**刷入方式完全不同**，界面上不标出来等于让人拿错：
+
+| 形态 | 卡上药丸 | 刷入方式 |
+| --- | --- | --- |
+| A/B 全量包 | `AB 全量包` | 系统内本地升级，或 recovery 侧载 |
+| OFP / EDL 线刷包 | `线刷包 OFP` | 必须用 EDL 工具走 **9008** 端口 |
+
+判断依据是 ZIP 首部的**条目名**（前 64 KB 里条目头都是明文，直接找子串即可，不必真走一遍 ZIP 结构）：
+
+- OFP：`ofp_version.txt` / `rawprogram*` / `copy_ofp_to_local*`
+- AB：`MY_MANIFEST` / `payload.bin` / `META-INF/com/android/metadata`；退一步看 `PRODUCT/`（单独用它不够可靠，OFP 包里也有同名目录，所以排最后）
+
+这一步复用 `enrich_as()` 里已有的那次 64 KB Range 请求（同一个 `meta::head()` 拿到的缓冲区），**不额外打网络**。
+
+**售后卡排序**：`version_key()` 要能识别「文件名尾部不是版本号」。线刷包长这样 —— `RMX3706domestic_11_A.43_2023070817200116`，尾部 14 位是构建日期戳。旧版把它当数字读，`2023070817200116 > 16`，于是 2023 年的包排到了 `16.0.3.501` 前面。现在的规则是：**带点的是正常版本号；不带点又超过 6 位的按「解析不出」处理**，退回整串比较（`version_cmp` 里空 key 最小），它们自然落在数字版本之后。
+
+**分区折叠**：售后通道一个机型三十多个包，全铺开会把「可用全量包」整段推出屏幕。`App::after_visible()` 在未展开时只返回前 `AFTER_PREVIEW`（=2）个 —— 1180×820 下一张卡约 130 px，留 2 张正好让下面那个分区也露出实卡；展开状态存在 `App::after_open`，换机型查询时重置。
+
 ## 4. 断点续传的位图格式
 
 进度文件与目标文件同目录、同名，后缀 `.partstate`：
@@ -202,7 +230,7 @@ src/app/             界面层：只消费 core 的结果，不直接发请求
 
 ## 5. 这样分层为什么便于扩展新来源
 
-现在已经有四条通道（官方 OTA / 升级链 / 官方售后 / 社区与社区售后），再加一个数据源（比如某个厂商的公开版本库）实际改动仍收敛在四点：
+现在已经有五条通道（官方 OTA / 升级链 / 官方售后 / 社区清单 / 社区售后 `afterSales`），再加一个数据源（比如某个厂商的公开版本库）实际改动仍收敛在四点：
 
 1. **数据模型不动**：新来源只需产出与现有相同的 `Package`（`version / android / size / manual_url / published / security_patch / branch / md5 / ota_version / source / vio / link_ok / note`）。界面层拿到的永远是 `Vec<Package>`。
 2. **来源枚举加一支**：`Source` 加一个变体（现有 `Official / Community / AfterSale / AfterCommunity` 四支），实现 `label()` / `key()` / `tip()` 三个小函数，卡片角标、筛选、致谢文案自动跟上。注意 `match` 都是穷尽的：漏改任何一处编译器都会直接报出来，不会静默漏掉。

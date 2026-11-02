@@ -9,6 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
+/// 售后分区收起时显示几张卡。
+///
+/// 售后通道一个机型常给三十多个包（实测 RMX3706 有 34 个），全铺开会把
+/// 「可用全量包」整段推到屏幕外 —— 那个分区才是日常要用的。
+/// 1180x820 下一张卡约 130px：预留 2 张，才能让下面「可用全量包」也露出实卡，
+/// 而不是只剩一行标题。想看全的点「展开全部」。
+pub const AFTER_PREVIEW: usize = 2;
+
 /// 状态栏语气
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tone {
@@ -68,6 +76,11 @@ pub struct App {
     pub aftersale: Vec<Package>,
     /// 售后通道本次的结局。列表为空时界面靠它区分「本来没有」和「这次没查通」。
     pub after_state: ota::AfterState,
+    /// 售后分区是否已展开。
+    ///
+    /// 售后通道一个机型常给三十多个包（RMX3706 有 34 个），全铺开会把
+    /// 「可用全量包」整段推到屏幕外；默认收起到前几个，点「展开全部」再看。
+    pub after_open: bool,
     query_rx: Option<Receiver<QueryResult>>,
     /// 社区源本次是否用上了（用不上时界面不展示相关文案）
     pub community_ok: bool,
@@ -111,6 +124,7 @@ impl App {
             packages: Vec::new(),
             aftersale: Vec::new(),
             after_state: ota::AfterState::Unknown,
+            after_open: false,
             query_rx: None,
             community_ok: false,
             probe_rx: None,
@@ -199,12 +213,26 @@ impl App {
         self.query(hit.code.to_string(), hit.name.to_string());
     }
 
+    /// 售后分区可折叠：默认只露前 AFTER_PREVIEW 个。
+    pub fn after_visible(&self) -> &[Package] {
+        if self.after_open || self.aftersale.len() <= AFTER_PREVIEW {
+            &self.aftersale
+        } else {
+            &self.aftersale[..AFTER_PREVIEW]
+        }
+    }
+
+    pub fn toggle_after(&mut self) {
+        self.after_open = !self.after_open;
+    }
+
     fn query(&mut self, code: String, label: String) {
         self.querying = true;
         self.pending = None;
         self.size_rx = None;
         self.packages.clear();
         self.aftersale.clear();
+        self.after_open = false;
         self.community_ok = false;
         self.probe_rx = None;
         self.link = None;
@@ -429,7 +457,10 @@ impl App {
                                     "社区源直链已复制（作者 Smart-Paocai），约 10 分钟内有效"
                                 }
                                 Source::AfterCommunity => {
-                                    "社区收录的售后直链已复制（作者 Smart-Paocai），约 10 分钟内有效"
+                                    // 社区售后这一路混着两种链：售后通道给的是长期裸链，
+                                    // 常规清单里的回退包给的是 10 分钟签名链。统一不说有效期，
+                                    // 只说「失效再点一次」，两种情况都不会讲错。
+                                    "社区收录的售后直链已复制（作者 Smart-Paocai），失效就再点一次"
                                 }
                                 Source::AfterSale => {
                                     "售后直链已复制，长期有效、支持断点续传"

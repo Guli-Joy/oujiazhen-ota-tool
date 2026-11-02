@@ -25,7 +25,8 @@ pub enum Source {
     Community,
     /// 售后（降级 / 维修）包：独立的 ColorOS 降级服务器
     AfterSale,
-    /// 社区源收录的降级 / 回退包：直链由第三方站点签发
+    /// 社区源收录的售后包：既有常规清单里标注「降级包」的回退包，
+    /// 也有售后通道里那批 EDL 线刷包，直链都由第三方站点签发
     AfterCommunity,
 }
 
@@ -56,7 +57,7 @@ impl Source {
             Source::Official => "版本与直链均由 OPPO 官方 OTA 服务器返回",
             Source::Community => "版本清单来自 VioletToolBox（作者 Smart-Paocai，GNU GPL v3.0）\nhttps://github.com/Smart-Paocai/VioletToolBox\n本工具仅调用其公开接口，未复制其源代码",
             Source::AfterSale => "售后（降级 / 维修）全量包，由 ColorOS 官方降级服务器签发\ndowngrade.coloros.com\n用于系统降级或售后维修刷机，直链长期有效、支持断点续传",
-            Source::AfterCommunity => "售后降级包，由 VioletToolBox（作者 Smart-Paocai，GNU GPL v3.0）收录\nhttps://github.com/Smart-Paocai/VioletToolBox\n官方售后服务器没下发的机型，可以在这里找找；直链由第三方站点签发，约 10 分钟内有效",
+            Source::AfterCommunity => "售后包，由 VioletToolBox（作者 Smart-Paocai，GNU GPL v3.0）收录\nhttps://github.com/Smart-Paocai/VioletToolBox\n含常规清单里的回退包与售后通道里的 EDL 线刷包；\n官方售后服务器没下发的机型，可以在这里找找",
         }
     }
 }
@@ -83,6 +84,12 @@ pub struct Package {
     pub link_ok: Option<bool>,
     /// 备注：售后包用它显示服务器给的用途说明（如「Enzo降级包」）
     pub note: String,
+    /// 固件封装形态：A/B 全量包还是 OFP / EDL 线刷包。
+    ///
+    /// 只有社区售后通道会给出线刷包，而这两类的刷入方式完全不同，
+    /// 界面上必须标出来，免得有人把线刷包丢进系统更新里。
+    #[serde(default)]
+    pub pack: crate::core::meta::Pack,
 }
 
 impl Package {
@@ -124,10 +131,17 @@ pub fn version_key(v: &str) -> String {
         .chars()
         .rev()
         .collect();
-    if digits.trim_matches('.').is_empty() {
+    let trimmed = digits.trim_matches('.');
+    // 售后通道里的线刷包长这样：RMX3706domestic_11_A.43_2023070817200116
+    // 尾部那串是 14 位日期戳，不是版本号。照数字读会让 2023 年的包
+    // 排到 16.0.3.501 前面（2023070817200116 > 16）。带点的是正常版本号，
+    // 不带点又特别长的按「解析不出来」处理，退回整串比较 —— 这样它们
+    // 自然落在数字版本后面（version_cmp 里空 key 最小）。
+    let is_stamp = !trimmed.contains('.') && trimmed.len() > 6;
+    if trimmed.is_empty() || is_stamp {
         core.trim().to_ascii_lowercase()
     } else {
-        digits.trim_matches('.').to_string()
+        trimmed.to_string()
     }
 }
 
@@ -207,6 +221,7 @@ fn package_of(data: &Value) -> Result<Package, String> {
         .to_string();
 
     Ok(Package {
+        pack: crate::core::meta::Pack::Ab,
         version,
         android: data
             .get("realAndroidVersion")
@@ -624,6 +639,17 @@ pub fn query_merged(code: &str, name: &str, brand: &str) -> Merged {
         })
     });
 
+    // 售后包是社区源的另一个通道：一个机型常有三十几条，全是 EDL 线刷包或
+    // A/B 全量包。它和上面那条走的是不同的接口、不同的设备名，必须单独查；
+    // 又因为它量大，单开一条线程，别让常规清单等它。
+    let (sc, sn, sb) = (code.to_string(), name.to_string(), brand.to_string());
+    let sale = std::thread::spawn(move || {
+        std::panic::catch_unwind(|| {
+            crate::core::violet::enrich_as(crate::core::violet::after_sales(&sc, &sn, &sb))
+        })
+        .unwrap_or_default()
+    });
+
     let mut all = branches.join().unwrap_or_default();
     let mut seen: std::collections::HashSet<String> = all.iter().map(|p| p.key()).collect();
     if let Ok(extra) = chain.join() {
@@ -673,13 +699,17 @@ pub fn query_merged(code: &str, name: &str, brand: &str) -> Merged {
         Soft::Unknown => AfterState::Unknown,
     };
 
-    // 社区源的降级包并进同一个分区，但排在官方之后：
-    // 官方直链长期有效、带 MD5，社区直链 10 分钟就过期，先给用户更好的那个。
+    // 社区源的两批售后包并进同一个分区，但排在官方之后：
+    // 官方直链长期有效、带 MD5，社区直链要现换，先给用户更好的那个。
     //
     // 去重只在社区内部做，不和官方比对：官方售后包的版本号来自 ZIP 里的
     // version_name，社区写的是它自己的版本名，两者字符串对不上，硬比会把
-    // 同一个包列两遍。宁可多一张卡，也不要让人以为「少了一个版本」。
-    after.list.extend(community.after);
+    // 同一个包列两遍。两个社区通道之间也不比 —— 同一个版本号在它们里
+    // 是两个不同的文件（实测体积差 2.2~2.6 GB），合并成一条会让人下错。
+    let mut extra = community.after;
+    extra.extend(sale.join().unwrap_or_default());
+    extra.sort_by(|a, b| version_cmp(&b.version, &a.version));
+    after.list.extend(extra);
 
     Merged {
         packages: all,

@@ -286,6 +286,8 @@ fn to_package(v: &Value) -> Package {
         .unwrap_or_else(|| "售后全量包".to_string());
 
     Package {
+        // 官方降级服务器下发的都是 A/B 全量包（ZIP 里带 payload.bin）
+        pack: crate::core::meta::Pack::Ab,
         version,
         android,
         size: count_of(v.get("fileSize")),

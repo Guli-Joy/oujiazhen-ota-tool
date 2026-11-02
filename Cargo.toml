@@ -1,6 +1,6 @@
 [package]
 name = "ota-tool"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "欧加真全量包下载工具 —— OPPO / 一加 / 真我 全量包检索、下载与校验"
 authors = ["Guli-Joy"]
